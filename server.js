@@ -1,12 +1,14 @@
 // server.js
-// WebSocket lobby + game manager (compatible with the provided client)
-// npm install express ws
+// WebSocket lobby + "impostor card" game manager
+// Install: npm install express ws
+// Run: node server.js
+// Listens on process.env.PORT or 1000 by default
 
 const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 1000;
 const LOBBY_COUNT = 4;
 const MAX_PLAYERS = 8;
 const WORDS = [
@@ -15,7 +17,7 @@ const WORDS = [
 ];
 
 const app = express();
-// Serve static files (assets, index.html) if you host client from same server
+// If you serve the client from the same server, put files in ./public
 app.use(express.static('public'));
 
 const server = http.createServer(app);
@@ -23,31 +25,38 @@ const wss = new WebSocket.Server({ server });
 
 // Data stores
 let nextPlayerId = 1;
-const players = new Map(); // playerId -> {id, ws, name, lobbyId, avatar}
+const players = new Map(); // playerId -> { id, ws, name, lobbyId, avatar }
 const lobbies = Array.from({ length: LOBBY_COUNT }, (_, i) => ({
   id: i + 1,
-  players: [], // array of playerIds
+  players: [],        // array of playerIds
   hostId: null,
-  state: 'waiting', // waiting | in_game | impostor_guess | voting | results
-  roles: {}, // playerId -> 'impostor'|'crewmate'
+  state: 'waiting',   // waiting | in_game | impostor_guess | voting | results
+  roles: {},          // playerId -> 'impostor'|'crewmate'
   word: null,
-  clues: {}, // playerId -> clue
-  votes: {}, // playerId -> targetId
+  clues: {},          // playerId -> clue
+  votes: {},          // playerId -> targetId
 }));
 
 /* Helpers */
 
-function broadcastAll(obj) {
-  const s = JSON.stringify(obj);
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) c.send(s);
-  });
+function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
 }
 
 function sendToPlayer(playerId, obj) {
   const p = players.get(playerId);
-  if (!p || !p.ws || p.ws.readyState !== WebSocket.OPEN) return;
-  try { p.ws.send(JSON.stringify(obj)); } catch (e) { /* ignore send errors */ }
+  if (!p || !p.ws) return;
+  safeSend(p.ws, obj);
+}
+
+function broadcastAll(obj) {
+  const s = JSON.stringify(obj);
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) {
+      try { c.send(s); } catch (e) {}
+    }
+  });
 }
 
 function sendLobbyList() {
@@ -72,9 +81,7 @@ function sendLobbyUpdate(lobbyId) {
     hostId: l.hostId,
     state: l.state
   };
-  // send to all players in lobby
   l.players.forEach(pid => sendToPlayer(pid, { type: 'lobby_update', lobby: lobbyInfo }));
-  // also update lobby list globally
   sendLobbyList();
 }
 
@@ -94,9 +101,8 @@ function startGame(lobby) {
 
   lobby.state = 'in_game';
   lobby.word = choose(WORDS);
-
-  // pick impostor
   const impostorId = choose(lobby.players);
+
   lobby.roles = {};
   lobby.players.forEach(pid => {
     lobby.roles[pid] = (pid === impostorId) ? 'impostor' : 'crewmate';
@@ -121,14 +127,15 @@ function startGame(lobby) {
 function checkCluesAndNotify(lobby) {
   if (!lobby) return;
   const crewmates = lobby.players.filter(pid => lobby.roles[pid] === 'crewmate');
-  const allSubmitted = crewmates.length > 0 && crewmates.every(pid => typeof lobby.clues[pid] === 'string');
-  if (allSubmitted) {
-    const impostorId = lobby.players.find(pid => lobby.roles[pid] === 'impostor');
-    const clues = crewmates.map(pid => ({ playerId: pid, clue: lobby.clues[pid] }));
-    sendToPlayer(impostorId, { type: 'clues_for_impostor', clues });
-    lobby.state = 'impostor_guess';
-    sendLobbyUpdate(lobby.id);
-  }
+  if (crewmates.length === 0) return;
+  const allSubmitted = crewmates.every(pid => typeof lobby.clues[pid] === 'string');
+  if (!allSubmitted) return;
+
+  const impostorId = lobby.players.find(pid => lobby.roles[pid] === 'impostor');
+  const clues = crewmates.map(pid => ({ playerId: pid, clue: lobby.clues[pid] }));
+  sendToPlayer(impostorId, { type: 'clues_for_impostor', clues });
+  lobby.state = 'impostor_guess';
+  sendLobbyUpdate(lobby.id);
 }
 
 function tallyVotes(lobby) {
@@ -138,16 +145,14 @@ function tallyVotes(lobby) {
     counts[tid] = (counts[tid] || 0) + 1;
   });
 
-  // find max and detect ties
+  // find highest count(s)
   let max = 0;
-  for (const tid in counts) {
-    if (counts[tid] > max) max = counts[tid];
-  }
+  for (const tid in counts) if (counts[tid] > max) max = counts[tid];
   const top = Object.keys(counts).filter(tid => counts[tid] === max);
 
   let eliminatedId = null;
   if (top.length === 1) eliminatedId = Number(top[0]); // unique top
-  // else tie -> no elimination (eliminatedId stays null)
+  // tie => no elimination
 
   const impostorId = lobby.players.find(pid => lobby.roles[pid] === 'impostor');
 
@@ -175,7 +180,7 @@ function tallyVotes(lobby) {
   lobby.state = 'results';
   sendLobbyUpdate(lobby.id);
 
-  // reset after short delay so players remain in lobby
+  // reset to waiting after short delay
   setTimeout(() => {
     lobby.state = 'waiting';
     lobby.word = null;
@@ -186,17 +191,50 @@ function tallyVotes(lobby) {
   }, 8000);
 }
 
+/* Kick helper */
+function kickPlayerFromLobby(requesterId, targetId) {
+  const requester = players.get(requesterId);
+  const target = players.get(targetId);
+  if (!requester || !target) return;
+  const lobby = lobbies.find(l => l.id === requester.lobbyId);
+  if (!lobby) return;
+  if (lobby.hostId !== requesterId) {
+    sendToPlayer(requesterId, { type: 'error', message: 'Only host can kick players' });
+    return;
+  }
+  if (!lobby.players.includes(targetId)) {
+    sendToPlayer(requesterId, { type: 'error', message: 'Target not in lobby' });
+    return;
+  }
+
+  // remove target from lobby
+  lobby.players = lobby.players.filter(x => x !== targetId);
+  if (lobby.hostId === targetId) lobby.hostId = lobby.players[0] || null;
+  target.lobbyId = null;
+
+  // notify target
+  sendToPlayer(targetId, { type: 'kicked', reason: 'Kicked by host' });
+
+  // update lobby
+  sendLobbyUpdate(lobby.id);
+}
+
 /* WebSocket handling */
 
 wss.on('connection', (ws) => {
   const pid = nextPlayerId++;
   players.set(pid, { id: pid, ws, name: `Player${pid}`, lobbyId: null, avatar: null });
-  try { ws.send(JSON.stringify({ type: 'connected', playerId: pid })); } catch (e) {}
+  console.log(`player connected: ${pid}`);
+
+  safeSend(ws, { type: 'connected', playerId: pid });
   sendLobbyList();
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch (e) { try { ws.send(JSON.stringify({ type: 'error', message: 'Invalid JSON' })); } catch (e2) {} return; }
+    try { msg = JSON.parse(raw); } catch (e) {
+      safeSend(ws, { type: 'error', message: 'Invalid JSON' });
+      return;
+    }
 
     const player = players.get(pid);
     if (!player) return;
@@ -207,7 +245,7 @@ wss.on('connection', (ws) => {
         break;
 
       case 'ping':
-        // optional heartbeat from client; ignore
+        // heartbeat from client; ignore or optionally respond
         break;
 
       case 'set_username':
@@ -220,11 +258,15 @@ wss.on('connection', (ws) => {
         if (player.lobbyId) sendLobbyUpdate(player.lobbyId);
         break;
 
+      case 'request_lobby_list':
+        sendLobbyList();
+        break;
+
       case 'join_lobby': {
         const lobbyId = Number(msg.lobbyId);
         const lobby = lobbies.find(l => l.id === lobbyId);
-        if (!lobby) { try { ws.send(JSON.stringify({ type: 'error', message: 'Invalid lobby' })); } catch (e) {} break; }
-        if (lobby.players.length >= MAX_PLAYERS) { try { ws.send(JSON.stringify({ type: 'error', message: 'Lobby full' })); } catch (e) {} break; }
+        if (!lobby) { safeSend(ws, { type: 'error', message: 'Invalid lobby' }); break; }
+        if (lobby.players.length >= MAX_PLAYERS) { safeSend(ws, { type: 'error', message: 'Lobby full' }); break; }
 
         // remove from previous lobby if any
         if (player.lobbyId) {
@@ -256,8 +298,8 @@ wss.on('connection', (ws) => {
 
       case 'start_game': {
         const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (!lobby) { try { ws.send(JSON.stringify({ type: 'error', message: 'Not in a lobby' })); } catch (e) {} break; }
-        if (lobby.hostId !== pid) { try { ws.send(JSON.stringify({ type: 'error', message: 'Only host can start' })); } catch (e) {} break; }
+        if (!lobby) { safeSend(ws, { type: 'error', message: 'Not in a lobby' }); break; }
+        if (lobby.hostId !== pid) { safeSend(ws, { type: 'error', message: 'Only host can start' }); break; }
         startGame(lobby);
         break;
       }
@@ -278,6 +320,7 @@ wss.on('connection', (ws) => {
         const lobby = lobbies.find(l => l.id === player.lobbyId);
         if (!lobby) break;
         if (lobby.roles[pid] !== 'impostor') break;
+        if (lobby.state !== 'impostor_guess') break;
         const guess = String(msg.guess || '').slice(0, 500);
         lobby.players.forEach(p => sendToPlayer(p, { type: 'impostor_guess_result', guess, by: pid, byName: player.name }));
         lobby.state = 'voting';
@@ -302,16 +345,19 @@ wss.on('connection', (ws) => {
         break;
       }
 
-      case 'request_lobby_list':
-        sendLobbyList();
+      case 'kick_player': {
+        const targetId = Number(msg.targetId);
+        kickPlayerFromLobby(pid, targetId);
         break;
+      }
 
       default:
-        try { ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' })); } catch (e) {}
+        safeSend(ws, { type: 'error', message: 'Unknown message type' });
     }
   });
 
   ws.on('close', () => {
+    console.log(`player disconnected: ${pid}`);
     const p = players.get(pid);
     if (p && p.lobbyId) {
       const lobby = lobbies.find(l => l.id === p.lobbyId);
@@ -326,7 +372,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('error', () => {
-    // ignore individual socket errors; close handler will clean up
+    // ignore; close handler will clean up
   });
 });
 
