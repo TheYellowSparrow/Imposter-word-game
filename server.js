@@ -1,6 +1,11 @@
 // server.js
 // Turn-based Impostor Word server: one player submits per turn, no duplicates.
 // Random player starts; order follows lobby insertion order. Robust advancing on submit/timeout/leave.
+// Improvements:
+// - MAX_PLAYERS set to 10
+// - turnOrder is kept in sync when players leave or are ejected
+// - currentTurnIndex adjusted to avoid selecting the same player twice
+// - defensive checks to avoid infinite loops when turnOrder shrinks
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -10,11 +15,30 @@ const PORT = process.env.PORT || 8080;
 const REVEAL_SECONDS = 5;
 const CLUE_SECONDS = 30; // per-turn seconds
 const VOTE_SECONDS = 30;
-const MAX_PLAYERS = 8;
+const MAX_PLAYERS = 10;
 
 const WORDS = [
   'apple','ocean','mountain','piano','rocket','coffee','forest','castle',
-  'river','guitar','banana','dragon','island','mirror','sunset','planet'
+  'river','guitar','banana','dragon','island','mirror','sunset','planet',
+  'theme park','christmas','war','astrocade','America',
+  'penguin','volcano','spaceship','train','camera','diamond','circus',
+  'library','pirate','rainbow','butterfly','city','tiger','chocolate',
+  'snowstorm','medicine','garden','football','telephone','submarine',
+  'candle','airplane','camel','pyramid','hamburger','bridge','moonlight',
+  'glacier','wizard','airship','cloud','compass','zebra','treasure',
+  'newspaper','backpack','village','whale','hurricane','radio',
+  'basketball','desert','lighthouse','jungle','robot','cookie','farm',
+  'honey','festival','thunder','airport','statue','painting','meteor',
+  'train station','telescope','laser','factory','spacesuit',
+  'vacuum cleaner','skyscraper','chessboard','temple','koala','harbor',
+  'black hole','clocktower','medieval','supermarket','playground',
+  'opera','fireplace','rollercoaster','lantern','carpet','marathon',
+  'windmill','bunker','science','parade','archery','canyon','avalanche',
+  'Australia','Canada','Germany','China','Japan','Brazil','Mexico',
+  'Argentina','India','Russia','France','Italy','Spain','Egypt',
+  'United Kingdom','Turkey','South Africa','South Korea','Sweden',
+  'Norway','Poland','Netherlands','Greece','Thailand',
+  'Europe','Asia','Africa','North America','South America','Oceania','Antarctica'
 ];
 
 const lobbies = {};
@@ -36,6 +60,7 @@ function broadcastToRoomExcept(roomId, obj, excludeId) {
 }
 function broadcastLobbyCounts() {
   const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
+  // wss is defined below; safe to reference here because this function is called after server/wss created
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
   });
@@ -75,11 +100,22 @@ wss.on('connection', (ws) => {
     if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
     if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
 
-    // if it was their turn, mark as submitted and advance
-    if (room.started && room.currentTurnId === ws._id) {
-      clearTurnTimeout(room);
-      room.submittedSet.add(ws._id); // consume their turn
-      advanceTurn(roomId);
+    // remove from turnOrder if present and adjust currentTurnIndex
+    if (Array.isArray(room.turnOrder) && room.turnOrder.length) {
+      const idx = room.turnOrder.indexOf(ws._id);
+      if (idx !== -1) {
+        room.turnOrder = room.turnOrder.filter(x => x !== ws._id);
+        // if removed index is before currentTurnIndex, shift index back by one to keep pointing to same logical next
+        if (idx < room.currentTurnIndex) {
+          room.currentTurnIndex = Math.max(0, room.currentTurnIndex - 1);
+        }
+        // if currentTurnId was the leaving player, mark as consumed and advance
+        if (room.currentTurnId === ws._id) {
+          clearTurnTimeout(room);
+          room.submittedSet.add(ws._id);
+          advanceTurn(roomId);
+        }
+      }
     }
 
     // notify remaining players
@@ -173,10 +209,18 @@ function handleMessage(ws, data) {
     if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
     if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
 
-    if (room.started && room.currentTurnId === ws._id) {
-      clearTurnTimeout(room);
-      room.submittedSet.add(ws._id);
-      advanceTurn(roomId);
+    // remove from turnOrder and adjust index
+    if (Array.isArray(room.turnOrder) && room.turnOrder.length) {
+      const idx = room.turnOrder.indexOf(ws._id);
+      if (idx !== -1) {
+        room.turnOrder = room.turnOrder.filter(x => x !== ws._id);
+        if (idx < room.currentTurnIndex) room.currentTurnIndex = Math.max(0, room.currentTurnIndex - 1);
+        if (room.started && room.currentTurnId === ws._id) {
+          clearTurnTimeout(room);
+          room.submittedSet.add(ws._id);
+          advanceTurn(roomId);
+        }
+      }
     }
 
     broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
@@ -244,7 +288,14 @@ function handleMessage(ws, data) {
 
     // prepare turn order and start first turn after reveal
     setTimeout(() => {
-      room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))); // fixed order for the round
+      // fixed order for the round: insertion order of players, filtered to alive
+      room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))).filter(id => room.alive[id]);
+      if (room.turnOrder.length === 0) {
+        // nothing to do, go to voting immediately
+        room.phase = 'vote';
+        broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
+        return;
+      }
       room.currentTurnIndex = Math.floor(Math.random() * room.turnOrder.length); // random start
       room.submittedSet = new Set();
       room.currentTurnId = null;
@@ -271,7 +322,8 @@ function handleMessage(ws, data) {
     broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.submittedSet.size, total: countAlive(room) });
 
     clearTurnTimeout(room);
-    advanceTurn(roomId); // always advance index so this player is not selected again
+    // advance index so this player is not selected again
+    advanceTurn(roomId);
     return;
   }
 
@@ -324,8 +376,25 @@ function startTurn(roomId) {
     return;
   }
 
+  // Defensive: if turnOrder is empty or all remaining in turnOrder have submitted, rebuild or go to voting
+  room.turnOrder = (Array.isArray(room.turnOrder) ? room.turnOrder : []).filter(id => room.alive[id]);
+  if (!room.turnOrder || room.turnOrder.length === 0) {
+    // nothing to turn through -> go to voting
+    room.phase = 'vote';
+    room.votesByVoter = new Map();
+    broadcastToRoom(roomId, { type: 'allCluesSubmitted' });
+    broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
+    room.turnTimeout = setTimeout(() => {
+      if (room.phase === 'vote') tallyVotesAndProceed(roomId);
+    }, VOTE_SECONDS * 1000 + 200);
+    return;
+  }
+
   const n = room.turnOrder.length;
   let attempts = 0;
+  // Ensure currentTurnIndex is within bounds
+  room.currentTurnIndex = ((room.currentTurnIndex % n) + n) % n;
+
   while (attempts < n) {
     const idx = room.currentTurnIndex % n;
     const candidateId = room.turnOrder[idx];
@@ -345,15 +414,32 @@ function startTurn(roomId) {
       // Timeout -> mark submitted (skipped) and advance past this candidate
       clearTurnTimeout(room);
       room.turnTimeout = setTimeout(() => {
-        room.submittedSet.add(candidateId);
-        broadcastToRoom(roomId, {
-          type: 'clueReceived',
-          from: candidateId,
-          text: '', // skipped
-          count: room.submittedSet.size,
-          total: countAlive(room)
-        });
-        room.currentTurnIndex = (room.currentTurnIndex + 1) % n; // move past candidate
+        // If candidate still exists and is alive, mark as skipped
+        if (room.turnOrder.includes(candidateId)) {
+          room.submittedSet.add(candidateId);
+          broadcastToRoom(roomId, {
+            type: 'clueReceived',
+            from: candidateId,
+            text: '', // skipped
+            count: room.submittedSet.size,
+            total: countAlive(room)
+          });
+        }
+        // Move index past this candidate (only if turnOrder still has elements)
+        room.turnOrder = room.turnOrder.filter(id => room.alive[id]); // keep it clean
+        if (room.turnOrder.length > 0) {
+          // find next index relative to current candidate
+          const newN = room.turnOrder.length;
+          // If candidate still present, find its index; otherwise, keep currentTurnIndex as-is modulo newN
+          const pos = room.turnOrder.indexOf(candidateId);
+          if (pos !== -1) {
+            room.currentTurnIndex = (pos + 1) % newN;
+          } else {
+            room.currentTurnIndex = room.currentTurnIndex % newN;
+          }
+        } else {
+          room.currentTurnIndex = 0;
+        }
         startTurn(roomId);
       }, CLUE_SECONDS * 1000);
 
@@ -378,8 +464,23 @@ function startTurn(roomId) {
 function advanceTurn(roomId) {
   const room = lobbies[roomId];
   if (!room) return;
-  const n = room.turnOrder.length || 1;
-  room.currentTurnIndex = (room.currentTurnIndex + 1) % n; // always move forward
+  // Clean turnOrder to only alive players
+  room.turnOrder = (Array.isArray(room.turnOrder) ? room.turnOrder : []).filter(id => room.alive[id]);
+  if (!room.turnOrder || room.turnOrder.length === 0) {
+    // nothing left -> go to voting
+    room.phase = 'vote';
+    room.votesByVoter = new Map();
+    broadcastToRoom(roomId, { type: 'allCluesSubmitted' });
+    broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
+    room.turnTimeout = setTimeout(() => {
+      if (room.phase === 'vote') tallyVotesAndProceed(roomId);
+    }, VOTE_SECONDS * 1000 + 200);
+    return;
+  }
+
+  const n = room.turnOrder.length;
+  // Move past the player that just finished (submitted or timed out)
+  room.currentTurnIndex = ((room.currentTurnIndex + 1) % n + n) % n;
   startTurn(roomId);
 }
 
@@ -419,6 +520,25 @@ function tallyVotesAndProceed(roomId) {
 
   const wasImpostor = ejectId === room.impostorId;
   room.alive[ejectId] = false;
+
+  // remove ejected from turnOrder and adjust currentTurnIndex
+  if (Array.isArray(room.turnOrder) && room.turnOrder.length) {
+    const idx = room.turnOrder.indexOf(ejectId);
+    if (idx !== -1) {
+      room.turnOrder = room.turnOrder.filter(x => x !== ejectId);
+      if (idx < room.currentTurnIndex) {
+        room.currentTurnIndex = Math.max(0, room.currentTurnIndex - 1);
+      } else if (idx === room.currentTurnIndex) {
+        // currentTurnIndex pointed to ejected player; keep it as-is so next startTurn picks the correct next
+        // but ensure it's within bounds
+        if (room.turnOrder.length > 0) {
+          room.currentTurnIndex = room.currentTurnIndex % room.turnOrder.length;
+        } else {
+          room.currentTurnIndex = 0;
+        }
+      }
+    }
+  }
 
   // scoring
   const votersWhoPickedImpostor = [];
@@ -469,10 +589,18 @@ function tallyVotesAndProceed(roomId) {
   } else {
     // next round: reset submissions and start from the player after ejected
     room.submittedSet = new Set();
-    const idx = room.turnOrder.indexOf(ejectId);
-    if (idx !== -1) {
-      room.currentTurnIndex = (idx + 1) % room.turnOrder.length;
+    // rebuild turnOrder to reflect current alive players and preserve insertion order
+    room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))).filter(id => room.alive[id]);
+    // find index of player after ejectId in the old turnOrder; if not found, keep currentTurnIndex
+    let nextIndex = 0;
+    if (room.turnOrder.length > 0) {
+      // try to find ejectId position in previous turnOrder; if not found, keep currentTurnIndex
+      // We already removed ejectId from previous turnOrder above; so just ensure currentTurnIndex is valid
+      room.currentTurnIndex = room.currentTurnIndex % room.turnOrder.length;
+    } else {
+      room.currentTurnIndex = 0;
     }
+
     setTimeout(() => {
       room.phase = 'clue-turns';
       startTurn(roomId);
