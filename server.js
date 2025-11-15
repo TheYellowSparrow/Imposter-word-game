@@ -1,4 +1,8 @@
 // server.js
+// Imposer Word game server (WebSocket)
+// - Fixes duplicate player entry on join by not broadcasting `playerJoined` to the joining client.
+// - Simple in-memory lobby management suitable for local testing / small deployments.
+
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
@@ -23,6 +27,7 @@ const lobbies = {};
 
 function makeId() { return crypto.randomBytes(6).toString('hex'); }
 function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (e) {} }
+
 function broadcastToRoom(roomId, obj) {
   const room = lobbies[roomId];
   if (!room) return;
@@ -30,8 +35,20 @@ function broadcastToRoom(roomId, obj) {
     send(p.ws, obj);
   }
 }
+
+// Broadcast to everyone in a room except the player with excludeId
+function broadcastToRoomExcept(roomId, obj, excludeId) {
+  const room = lobbies[roomId];
+  if (!room) return;
+  for (const [, p] of room.players) {
+    if (p.id === excludeId) continue;
+    send(p.ws, obj);
+  }
+}
+
 function broadcastLobbyCounts() {
   const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
+  // send to all connected clients
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
   });
@@ -65,18 +82,23 @@ wss.on('connection', (ws) => {
     if (!ws._room) return;
     const room = lobbies[ws._room];
     if (!room) return;
+
+    // remove player
     room.players.delete(ws._id);
-    broadcastToRoom(ws._room, { type: 'playerLeft', room: ws._room, id: ws._id });
+
+    // notify remaining players (exclude the closed socket)
+    broadcastToRoomExcept(ws._room, { type: 'playerLeft', room: ws._room, id: ws._id }, ws._id);
     broadcastLobbyCounts();
 
     // reassign host if needed
     if (room.hostId === ws._id) {
       const next = room.players.keys().next();
       room.hostId = next.done ? null : next.value;
-      // notify remaining players of new host via lobby info
+      // notify remaining players of new host / lobby info
       broadcastToRoom(ws._room, { type: 'lobbyInfo', room: ws._room, count: room.players.size });
     }
 
+    // cleanup empty room
     if (room.players.size === 0) {
       delete lobbies[ws._room];
       broadcastLobbyCounts();
@@ -122,12 +144,12 @@ function handleMessage(ws, data) {
     room.players.set(ws._id, { ws, id: ws._id, name, ready: false, score: 0 });
     if (!room.hostId) room.hostId = ws._id;
 
-    // send joined to the joining client
+    // send joined to the joining client (full current players list)
     const playersArr = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, ready: p.ready, score: p.score }));
     send(ws, { type: 'joined', room: roomId, hostId: room.hostId, players: playersArr });
 
-    // broadcast playerJoined to others
-    broadcastToRoom(roomId, { type: 'playerJoined', room: roomId, player: { id: ws._id, name, ready: false, score: 0 } });
+    // broadcast playerJoined to others in the room (exclude the joining client to avoid duplicate)
+    broadcastToRoomExcept(roomId, { type: 'playerJoined', room: roomId, player: { id: ws._id, name, ready: false, score: 0 } }, ws._id);
 
     // update lobby counts globally
     broadcastLobbyCounts();
@@ -139,12 +161,18 @@ function handleMessage(ws, data) {
     if (!roomId) return;
     const room = lobbies[roomId];
     if (!room) return;
+
     room.players.delete(ws._id);
     ws._room = null;
-    broadcastToRoom(roomId, { type: 'playerLeft', room: roomId, id: ws._id });
+
+    // notify remaining players (exclude leaving client)
+    broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
     broadcastLobbyCounts();
-    if (room.players.size === 0) delete lobbies[roomId];
-    else if (room.hostId === ws._id) {
+
+    if (room.players.size === 0) {
+      delete lobbies[roomId];
+      broadcastLobbyCounts();
+    } else if (room.hostId === ws._id) {
       room.hostId = room.players.keys().next().value;
       broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
     }
@@ -187,7 +215,7 @@ function handleMessage(ws, data) {
     // build roles array (role text is either 'IMPOSTOR' or the secret word)
     const roles = ids.map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
 
-    // broadcast gameStarted (client will use roles array but only display its own role)
+    // broadcast gameStarted (clients will display only their own role)
     broadcastToRoom(roomId, {
       type: 'gameStarted',
       roles,
@@ -210,11 +238,13 @@ function handleMessage(ws, data) {
     const text = (data.text || '').slice(0, 200);
     room.clues.push({ from: ws._id, text });
 
-    // broadcast the clue
+    // broadcast the clue to everyone (including the clue-giver)
     broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.clues.length, total: 1 });
 
     // move to discussion -> voting automatically
     room.phase = 'discussion';
+
+    // small delay to ensure clients process the clue
     setTimeout(() => {
       broadcastToRoom(roomId, { type: 'cluePhaseEnded' });
       broadcastToRoom(roomId, { type: 'discussionStarted', seconds: DISCUSSION_SECONDS });
