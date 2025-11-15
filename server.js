@@ -1,381 +1,319 @@
 // server.js
-// WebSocket lobby + "impostor card" game manager
-// Install: npm install express ws
-// Run: node server.js
-// Listens on process.env.PORT or 1000 by default
-
-const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
-const PORT = Number(process.env.PORT) || 1000;
-const LOBBY_COUNT = 4;
-const MAX_PLAYERS = 8;
+const PORT = process.env.PORT || 8080;
+const CLUE_SECONDS = 45;
+const DISCUSSION_SECONDS = 30;
+const VOTE_SECONDS = 30;
+
 const WORDS = [
-  'planet','ocean','forest','castle','robot','piano','rocket','diamond','shadow','mirror',
-  'river','mountain','island','garden','library','bridge','candle','feather','comet','lantern'
+  'apple','ocean','mountain','piano','rocket','coffee','forest','castle',
+  'river','guitar','banana','dragon','island','mirror','sunset','planet'
 ];
 
-const app = express();
-// If you serve the client from the same server, put files in ./public
-app.use(express.static('public'));
+// In-memory lobbies
+// lobbies[roomId] = {
+//   players: Map(playerId -> { ws, id, name, ready, score }),
+//   hostId, started, word, impostorId, firstClueGiverId,
+//   clues: [{from, text}], votesByVoter: Map(voterId -> votedId), phase
+// }
+const lobbies = {};
 
-const server = http.createServer(app);
+function makeId() { return crypto.randomBytes(6).toString('hex'); }
+function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (e) {} }
+function broadcastToRoom(roomId, obj) {
+  const room = lobbies[roomId];
+  if (!room) return;
+  for (const [, p] of room.players) {
+    send(p.ws, obj);
+  }
+}
+function broadcastLobbyCounts() {
+  const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
+  wss.clients.forEach(c => {
+    if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
+  });
+}
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Impostor Word server\n');
+});
+
 const wss = new WebSocket.Server({ server });
 
-// Data stores
-let nextPlayerId = 1;
-const players = new Map(); // playerId -> { id, ws, name, lobbyId, avatar }
-const lobbies = Array.from({ length: LOBBY_COUNT }, (_, i) => ({
-  id: i + 1,
-  players: [],        // array of playerIds
-  hostId: null,
-  state: 'waiting',   // waiting | in_game | impostor_guess | voting | results
-  roles: {},          // playerId -> 'impostor'|'crewmate'
-  word: null,
-  clues: {},          // playerId -> clue
-  votes: {},          // playerId -> targetId
-}));
-
-/* Helpers */
-
-function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  try { ws.send(JSON.stringify(obj)); } catch (e) { /* ignore */ }
-}
-
-function sendToPlayer(playerId, obj) {
-  const p = players.get(playerId);
-  if (!p || !p.ws) return;
-  safeSend(p.ws, obj);
-}
-
-function broadcastAll(obj) {
-  const s = JSON.stringify(obj);
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) {
-      try { c.send(s); } catch (e) {}
-    }
-  });
-}
-
-function sendLobbyList() {
-  const list = lobbies.map(l => ({
-    id: l.id,
-    count: l.players.length,
-    maxPlayers: MAX_PLAYERS,
-    state: l.state
-  }));
-  broadcastAll({ type: 'lobby_list', lobbies: list });
-}
-
-function sendLobbyUpdate(lobbyId) {
-  const l = lobbies.find(x => x.id === lobbyId);
-  if (!l) return;
-  const lobbyInfo = {
-    id: l.id,
-    players: l.players.map(pid => {
-      const p = players.get(pid);
-      return { id: pid, name: p ? p.name : 'Anonymous', avatar: p ? p.avatar || null : null };
-    }),
-    hostId: l.hostId,
-    state: l.state
-  };
-  l.players.forEach(pid => sendToPlayer(pid, { type: 'lobby_update', lobby: lobbyInfo }));
-  sendLobbyList();
-}
-
-function choose(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
-}
-
-/* Game flow */
-
-function startGame(lobby) {
-  if (!lobby) return;
-  if (lobby.state !== 'waiting') return;
-  if (lobby.players.length < 2) {
-    lobby.players.forEach(pid => sendToPlayer(pid, { type: 'error', message: 'Need at least 2 players to start' }));
-    return;
-  }
-
-  lobby.state = 'in_game';
-  lobby.word = choose(WORDS);
-  const impostorId = choose(lobby.players);
-
-  lobby.roles = {};
-  lobby.players.forEach(pid => {
-    lobby.roles[pid] = (pid === impostorId) ? 'impostor' : 'crewmate';
-  });
-
-  lobby.clues = {};
-  lobby.votes = {};
-
-  // send role messages
-  lobby.players.forEach(pid => {
-    const role = lobby.roles[pid];
-    if (role === 'crewmate') {
-      sendToPlayer(pid, { type: 'role', role: 'crewmate', word: lobby.word });
-    } else {
-      sendToPlayer(pid, { type: 'role', role: 'impostor' });
-    }
-  });
-
-  sendLobbyUpdate(lobby.id);
-}
-
-function checkCluesAndNotify(lobby) {
-  if (!lobby) return;
-  const crewmates = lobby.players.filter(pid => lobby.roles[pid] === 'crewmate');
-  if (crewmates.length === 0) return;
-  const allSubmitted = crewmates.every(pid => typeof lobby.clues[pid] === 'string');
-  if (!allSubmitted) return;
-
-  const impostorId = lobby.players.find(pid => lobby.roles[pid] === 'impostor');
-  const clues = crewmates.map(pid => ({ playerId: pid, clue: lobby.clues[pid] }));
-  sendToPlayer(impostorId, { type: 'clues_for_impostor', clues });
-  lobby.state = 'impostor_guess';
-  sendLobbyUpdate(lobby.id);
-}
-
-function tallyVotes(lobby) {
-  if (!lobby) return;
-  const counts = {};
-  Object.values(lobby.votes).forEach(tid => {
-    counts[tid] = (counts[tid] || 0) + 1;
-  });
-
-  // find highest count(s)
-  let max = 0;
-  for (const tid in counts) if (counts[tid] > max) max = counts[tid];
-  const top = Object.keys(counts).filter(tid => counts[tid] === max);
-
-  let eliminatedId = null;
-  if (top.length === 1) eliminatedId = Number(top[0]); // unique top
-  // tie => no elimination
-
-  const impostorId = lobby.players.find(pid => lobby.roles[pid] === 'impostor');
-
-  let winner = 'impostor';
-  let message = '';
-  if (eliminatedId && eliminatedId === impostorId) {
-    winner = 'crewmates';
-    message = `Impostor was eliminated (${players.get(eliminatedId).name}).`;
-  } else {
-    winner = 'impostor';
-    message = `Impostor survived.`;
-  }
-
-  lobby.players.forEach(pid => {
-    sendToPlayer(pid, {
-      type: 'voting_result',
-      winner,
-      message,
-      eliminatedId: eliminatedId || null,
-      eliminatedName: eliminatedId ? players.get(eliminatedId).name : null,
-      impostorId
-    });
-  });
-
-  lobby.state = 'results';
-  sendLobbyUpdate(lobby.id);
-
-  // reset to waiting after short delay
-  setTimeout(() => {
-    lobby.state = 'waiting';
-    lobby.word = null;
-    lobby.roles = {};
-    lobby.clues = {};
-    lobby.votes = {};
-    sendLobbyUpdate(lobby.id);
-  }, 8000);
-}
-
-/* Kick helper */
-function kickPlayerFromLobby(requesterId, targetId) {
-  const requester = players.get(requesterId);
-  const target = players.get(targetId);
-  if (!requester || !target) return;
-  const lobby = lobbies.find(l => l.id === requester.lobbyId);
-  if (!lobby) return;
-  if (lobby.hostId !== requesterId) {
-    sendToPlayer(requesterId, { type: 'error', message: 'Only host can kick players' });
-    return;
-  }
-  if (!lobby.players.includes(targetId)) {
-    sendToPlayer(requesterId, { type: 'error', message: 'Target not in lobby' });
-    return;
-  }
-
-  // remove target from lobby
-  lobby.players = lobby.players.filter(x => x !== targetId);
-  if (lobby.hostId === targetId) lobby.hostId = lobby.players[0] || null;
-  target.lobbyId = null;
-
-  // notify target
-  sendToPlayer(targetId, { type: 'kicked', reason: 'Kicked by host' });
-
-  // update lobby
-  sendLobbyUpdate(lobby.id);
-}
-
-/* WebSocket handling */
-
 wss.on('connection', (ws) => {
-  const pid = nextPlayerId++;
-  players.set(pid, { id: pid, ws, name: `Player${pid}`, lobbyId: null, avatar: null });
-  console.log(`player connected: ${pid}`);
+  const id = makeId();
+  ws._id = id;
+  ws._room = null;
+  ws._name = null;
+  ws._ready = false;
+  ws._score = 0;
 
-  safeSend(ws, { type: 'connected', playerId: pid });
-  sendLobbyList();
+  // send assigned id
+  send(ws, { type: 'id', id });
 
   ws.on('message', (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw); } catch (e) {
-      safeSend(ws, { type: 'error', message: 'Invalid JSON' });
-      return;
-    }
-
-    const player = players.get(pid);
-    if (!player) return;
-
-    switch (msg.type) {
-      case 'hello':
-        // no-op
-        break;
-
-      case 'ping':
-        // heartbeat from client; ignore or optionally respond
-        break;
-
-      case 'set_username':
-        player.name = String(msg.username || '').slice(0, 40) || player.name;
-        if (player.lobbyId) sendLobbyUpdate(player.lobbyId);
-        break;
-
-      case 'set_avatar':
-        player.avatar = msg.avatarUrl ? String(msg.avatarUrl).slice(0, 1000) : null;
-        if (player.lobbyId) sendLobbyUpdate(player.lobbyId);
-        break;
-
-      case 'request_lobby_list':
-        sendLobbyList();
-        break;
-
-      case 'join_lobby': {
-        const lobbyId = Number(msg.lobbyId);
-        const lobby = lobbies.find(l => l.id === lobbyId);
-        if (!lobby) { safeSend(ws, { type: 'error', message: 'Invalid lobby' }); break; }
-        if (lobby.players.length >= MAX_PLAYERS) { safeSend(ws, { type: 'error', message: 'Lobby full' }); break; }
-
-        // remove from previous lobby if any
-        if (player.lobbyId) {
-          const prev = lobbies.find(x => x.id === player.lobbyId);
-          if (prev) {
-            prev.players = prev.players.filter(x => x !== pid);
-            if (prev.hostId === pid) prev.hostId = prev.players[0] || null;
-            sendLobbyUpdate(prev.id);
-          }
-        }
-
-        lobby.players.push(pid);
-        player.lobbyId = lobby.id;
-        if (!lobby.hostId) lobby.hostId = pid;
-        sendLobbyUpdate(lobby.id);
-        break;
-      }
-
-      case 'leave_lobby': {
-        const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (lobby) {
-          lobby.players = lobby.players.filter(x => x !== pid);
-          if (lobby.hostId === pid) lobby.hostId = lobby.players[0] || null;
-          player.lobbyId = null;
-          sendLobbyUpdate(lobby.id);
-        }
-        break;
-      }
-
-      case 'start_game': {
-        const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (!lobby) { safeSend(ws, { type: 'error', message: 'Not in a lobby' }); break; }
-        if (lobby.hostId !== pid) { safeSend(ws, { type: 'error', message: 'Only host can start' }); break; }
-        startGame(lobby);
-        break;
-      }
-
-      case 'submit_clue': {
-        const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (!lobby) break;
-        if (lobby.state !== 'in_game') break;
-        if (lobby.roles[pid] !== 'crewmate') break;
-        const clue = String(msg.clue || '').slice(0, 200);
-        lobby.clues[pid] = clue;
-        sendLobbyUpdate(lobby.id);
-        checkCluesAndNotify(lobby);
-        break;
-      }
-
-      case 'impostor_guess': {
-        const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (!lobby) break;
-        if (lobby.roles[pid] !== 'impostor') break;
-        if (lobby.state !== 'impostor_guess') break;
-        const guess = String(msg.guess || '').slice(0, 500);
-        lobby.players.forEach(p => sendToPlayer(p, { type: 'impostor_guess_result', guess, by: pid, byName: player.name }));
-        lobby.state = 'voting';
-        lobby.votes = {};
-        lobby.players.forEach(p => sendToPlayer(p, { type: 'voting_start', players: lobby.players.map(pid => {
-          const pl = players.get(pid);
-          return { id: pid, name: pl ? pl.name : 'Anonymous' };
-        }) }));
-        sendLobbyUpdate(lobby.id);
-        break;
-      }
-
-      case 'vote': {
-        const lobby = lobbies.find(l => l.id === player.lobbyId);
-        if (!lobby) break;
-        if (lobby.state !== 'voting') break;
-        const targetId = Number(msg.targetId);
-        if (!lobby.players.includes(targetId)) break;
-        lobby.votes[pid] = targetId;
-        const allVoted = lobby.players.every(p => typeof lobby.votes[p] !== 'undefined');
-        if (allVoted) tallyVotes(lobby);
-        break;
-      }
-
-      case 'kick_player': {
-        const targetId = Number(msg.targetId);
-        kickPlayerFromLobby(pid, targetId);
-        break;
-      }
-
-      default:
-        safeSend(ws, { type: 'error', message: 'Unknown message type' });
-    }
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { return; }
+    handleMessage(ws, data);
   });
 
   ws.on('close', () => {
-    console.log(`player disconnected: ${pid}`);
-    const p = players.get(pid);
-    if (p && p.lobbyId) {
-      const lobby = lobbies.find(l => l.id === p.lobbyId);
-      if (lobby) {
-        lobby.players = lobby.players.filter(x => x !== pid);
-        if (lobby.hostId === pid) lobby.hostId = lobby.players[0] || null;
-        sendLobbyUpdate(lobby.id);
-      }
-    }
-    players.delete(pid);
-    sendLobbyList();
-  });
+    if (!ws._room) return;
+    const room = lobbies[ws._room];
+    if (!room) return;
+    room.players.delete(ws._id);
+    broadcastToRoom(ws._room, { type: 'playerLeft', room: ws._room, id: ws._id });
+    broadcastLobbyCounts();
 
-  ws.on('error', () => {
-    // ignore; close handler will clean up
+    // reassign host if needed
+    if (room.hostId === ws._id) {
+      const next = room.players.keys().next();
+      room.hostId = next.done ? null : next.value;
+      // notify remaining players of new host via lobby info
+      broadcastToRoom(ws._room, { type: 'lobbyInfo', room: ws._room, count: room.players.size });
+    }
+
+    if (room.players.size === 0) {
+      delete lobbies[ws._room];
+      broadcastLobbyCounts();
+    }
   });
 });
 
+function handleMessage(ws, data) {
+  const type = data.type;
+
+  if (type === 'listLobbies') {
+    const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
+    send(ws, { type: 'lobbyList', lobbies: arr });
+    return;
+  }
+
+  if (type === 'join') {
+    const roomId = data.room;
+    const name = (data.name || 'Player').slice(0, 32);
+    if (!roomId) { send(ws, { type: 'error', message: 'Missing room' }); return; }
+
+    if (!lobbies[roomId]) {
+      lobbies[roomId] = {
+        players: new Map(),
+        hostId: null,
+        started: false,
+        word: null,
+        impostorId: null,
+        firstClueGiverId: null,
+        clues: [],
+        votesByVoter: new Map(),
+        phase: 'lobby'
+      };
+    }
+    const room = lobbies[roomId];
+    if (room.players.size >= 8) { send(ws, { type: 'error', message: 'Lobby full' }); return; }
+
+    ws._room = roomId;
+    ws._name = name;
+    ws._ready = false;
+    ws._score = 0;
+
+    room.players.set(ws._id, { ws, id: ws._id, name, ready: false, score: 0 });
+    if (!room.hostId) room.hostId = ws._id;
+
+    // send joined to the joining client
+    const playersArr = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, ready: p.ready, score: p.score }));
+    send(ws, { type: 'joined', room: roomId, hostId: room.hostId, players: playersArr });
+
+    // broadcast playerJoined to others
+    broadcastToRoom(roomId, { type: 'playerJoined', room: roomId, player: { id: ws._id, name, ready: false, score: 0 } });
+
+    // update lobby counts globally
+    broadcastLobbyCounts();
+    return;
+  }
+
+  if (type === 'leave') {
+    const roomId = data.room || ws._room;
+    if (!roomId) return;
+    const room = lobbies[roomId];
+    if (!room) return;
+    room.players.delete(ws._id);
+    ws._room = null;
+    broadcastToRoom(roomId, { type: 'playerLeft', room: roomId, id: ws._id });
+    broadcastLobbyCounts();
+    if (room.players.size === 0) delete lobbies[roomId];
+    else if (room.hostId === ws._id) {
+      room.hostId = room.players.keys().next().value;
+      broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
+    }
+    return;
+  }
+
+  if (type === 'ready' || type === 'unready') {
+    const roomId = ws._room;
+    if (!roomId) return;
+    const room = lobbies[roomId];
+    if (!room) return;
+    const p = room.players.get(ws._id);
+    if (!p) return;
+    p.ready = (type === 'ready');
+    broadcastToRoom(roomId, { type: p.ready ? 'playerReady' : 'playerUnready', id: ws._id });
+
+    const allReady = Array.from(room.players.values()).every(x => x.ready);
+    if (allReady) broadcastToRoom(roomId, { type: 'allReady' });
+    return;
+  }
+
+  if (type === 'startGame') {
+    const roomId = ws._room;
+    if (!roomId) return;
+    const room = lobbies[roomId];
+    if (!room) return;
+    if (room.hostId !== ws._id) { send(ws, { type: 'error', message: 'Only host can start' }); return; }
+    if (room.players.size < 3) { send(ws, { type: 'error', message: 'Need at least 3 players' }); return; }
+
+    // initialize round
+    room.started = true;
+    room.word = WORDS[Math.floor(Math.random() * WORDS.length)];
+    const ids = Array.from(room.players.keys());
+    room.impostorId = ids[Math.floor(Math.random() * ids.length)];
+    room.firstClueGiverId = ids[Math.floor(Math.random() * ids.length)];
+    room.clues = [];
+    room.votesByVoter = new Map();
+    room.phase = 'clue';
+
+    // build roles array (role text is either 'IMPOSTOR' or the secret word)
+    const roles = ids.map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
+
+    // broadcast gameStarted (client will use roles array but only display its own role)
+    broadcastToRoom(roomId, {
+      type: 'gameStarted',
+      roles,
+      firstClueGiverId: room.firstClueGiverId,
+      seconds: CLUE_SECONDS,
+      playersCount: room.players.size
+    });
+
+    return;
+  }
+
+  if (type === 'clue') {
+    const roomId = ws._room;
+    if (!roomId) return;
+    const room = lobbies[roomId];
+    if (!room) return;
+    if (room.phase !== 'clue') { send(ws, { type: 'error', message: 'Not in clue phase' }); return; }
+    if (ws._id !== room.firstClueGiverId) { send(ws, { type: 'error', message: 'Not your turn to give a clue' }); return; }
+
+    const text = (data.text || '').slice(0, 200);
+    room.clues.push({ from: ws._id, text });
+
+    // broadcast the clue
+    broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.clues.length, total: 1 });
+
+    // move to discussion -> voting automatically
+    room.phase = 'discussion';
+    setTimeout(() => {
+      broadcastToRoom(roomId, { type: 'cluePhaseEnded' });
+      broadcastToRoom(roomId, { type: 'discussionStarted', seconds: DISCUSSION_SECONDS });
+
+      // after discussion, start voting
+      setTimeout(() => {
+        room.phase = 'vote';
+        broadcastToRoom(roomId, { type: 'votingStarted', seconds: VOTE_SECONDS });
+      }, DISCUSSION_SECONDS * 1000);
+
+    }, 800);
+
+    return;
+  }
+
+  if (type === 'voteImpostor') {
+    const roomId = ws._room;
+    if (!roomId) return;
+    const room = lobbies[roomId];
+    if (!room) return;
+    if (room.phase !== 'vote') { send(ws, { type: 'error', message: 'Not in voting phase' }); return; }
+
+    const votedId = data.votedId;
+    if (!room.players.has(votedId)) { send(ws, { type: 'error', message: 'Invalid vote target' }); return; }
+
+    // record or update vote
+    room.votesByVoter.set(ws._id, votedId);
+    send(ws, { type: 'voteReceived', from: ws._id });
+
+    // if all players have voted, tally immediately
+    if (room.votesByVoter.size >= room.players.size) {
+      // tally
+      const tally = {};
+      for (const voted of room.votesByVoter.values()) tally[voted] = (tally[voted] || 0) + 1;
+
+      // compute who voted for impostor (we can award points to voters who voted correctly)
+      const impostorId = room.impostorId;
+      const votersWhoPickedImpostor = [];
+      for (const [voter, voted] of room.votesByVoter.entries()) {
+        if (voted === impostorId) votersWhoPickedImpostor.push(voter);
+      }
+
+      // scoring:
+      // - each voter who correctly picked the impostor gets +1
+      // - if nobody picked the impostor, impostor gets +1
+      if (votersWhoPickedImpostor.length > 0) {
+        for (const voterId of votersWhoPickedImpostor) {
+          const p = room.players.get(voterId);
+          if (p) p.score = (p.score || 0) + 1;
+        }
+      } else {
+        const imp = room.players.get(impostorId);
+        if (imp) imp.score = (imp.score || 0) + 1;
+      }
+
+      // prepare results array
+      const results = [];
+      for (const [id, p] of room.players) {
+        results.push({
+          id,
+          name: p.name,
+          votes: tally[id] || 0,
+          wasImpostor: id === impostorId,
+          score: p.score || 0
+        });
+      }
+
+      // broadcast round results
+      broadcastToRoom(roomId, { type: 'roundResults', results });
+
+      // end of game for this simple server: send gameOver with standings
+      const standings = Array.from(room.players.values())
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .map(p => ({ id: p.id, name: p.name, score: p.score || 0 }));
+
+      setTimeout(() => {
+        broadcastToRoom(roomId, { type: 'gameOver', standings });
+
+        // reset lobby state for next game
+        room.started = false;
+        room.word = null;
+        room.impostorId = null;
+        room.firstClueGiverId = null;
+        room.clues = [];
+        room.votesByVoter = new Map();
+        room.phase = 'lobby';
+        // reset ready flags (players keep their scores)
+        for (const [, p] of room.players) p.ready = false;
+        broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
+      }, 1200);
+    }
+
+    return;
+  }
+
+  // unknown type -> ignore
+}
+
+// start server
 server.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Impostor Word server listening on port ${PORT}`);
 });
