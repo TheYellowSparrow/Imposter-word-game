@@ -1,33 +1,27 @@
 // server.js
 // Imposer Word game server (WebSocket)
-// - Fixes duplicate player entry on join by not broadcasting `playerJoined` to the joining client.
-// - Simple in-memory lobby management suitable for local testing / small deployments.
+// - Full game loop: reveal roles, repeated clue rounds, voting, ejection, continue until impostor ejected or 2 players left.
+// - Players who are ejected become spectators and cannot submit clues or vote.
 
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
 
 const PORT = process.env.PORT || 8080;
+const REVEAL_SECONDS = 5;
 const CLUE_SECONDS = 45;
-const DISCUSSION_SECONDS = 30;
 const VOTE_SECONDS = 30;
+const DISCUSSION_SECONDS = 0; // not used separately here
 
 const WORDS = [
   'apple','ocean','mountain','piano','rocket','coffee','forest','castle',
   'river','guitar','banana','dragon','island','mirror','sunset','planet'
 ];
 
-// In-memory lobbies
-// lobbies[roomId] = {
-//   players: Map(playerId -> { ws, id, name, ready, score }),
-//   hostId, started, word, impostorId, firstClueGiverId,
-//   clues: [{from, text}], votesByVoter: Map(voterId -> votedId), phase
-// }
-const lobbies = {};
+const lobbies = {}; // in-memory
 
 function makeId() { return crypto.randomBytes(6).toString('hex'); }
 function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (e) {} }
-
 function broadcastToRoom(roomId, obj) {
   const room = lobbies[roomId];
   if (!room) return;
@@ -35,8 +29,6 @@ function broadcastToRoom(roomId, obj) {
     send(p.ws, obj);
   }
 }
-
-// Broadcast to everyone in a room except the player with excludeId
 function broadcastToRoomExcept(roomId, obj, excludeId) {
   const room = lobbies[roomId];
   if (!room) return;
@@ -45,10 +37,8 @@ function broadcastToRoomExcept(roomId, obj, excludeId) {
     send(p.ws, obj);
   }
 }
-
 function broadcastLobbyCounts() {
   const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
-  // send to all connected clients
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
   });
@@ -69,7 +59,6 @@ wss.on('connection', (ws) => {
   ws._ready = false;
   ws._score = 0;
 
-  // send assigned id
   send(ws, { type: 'id', id });
 
   ws.on('message', (raw) => {
@@ -82,11 +71,7 @@ wss.on('connection', (ws) => {
     if (!ws._room) return;
     const room = lobbies[ws._room];
     if (!room) return;
-
-    // remove player
     room.players.delete(ws._id);
-
-    // notify remaining players (exclude the closed socket)
     broadcastToRoomExcept(ws._room, { type: 'playerLeft', room: ws._room, id: ws._id }, ws._id);
     broadcastLobbyCounts();
 
@@ -94,11 +79,9 @@ wss.on('connection', (ws) => {
     if (room.hostId === ws._id) {
       const next = room.players.keys().next();
       room.hostId = next.done ? null : next.value;
-      // notify remaining players of new host / lobby info
       broadcastToRoom(ws._room, { type: 'lobbyInfo', room: ws._room, count: room.players.size });
     }
 
-    // cleanup empty room
     if (room.players.size === 0) {
       delete lobbies[ws._room];
       broadcastLobbyCounts();
@@ -127,10 +110,11 @@ function handleMessage(ws, data) {
         started: false,
         word: null,
         impostorId: null,
-        firstClueGiverId: null,
-        clues: [],
+        clues: new Map(), // playerId -> text for current round
         votesByVoter: new Map(),
-        phase: 'lobby'
+        phase: 'lobby',
+        alive: {}, // id -> boolean
+        scores: {}
       };
     }
     const room = lobbies[roomId];
@@ -144,14 +128,13 @@ function handleMessage(ws, data) {
     room.players.set(ws._id, { ws, id: ws._id, name, ready: false, score: 0 });
     if (!room.hostId) room.hostId = ws._id;
 
-    // send joined to the joining client (full current players list)
+    // send joined to the joining client
     const playersArr = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, ready: p.ready, score: p.score }));
     send(ws, { type: 'joined', room: roomId, hostId: room.hostId, players: playersArr });
 
-    // broadcast playerJoined to others in the room (exclude the joining client to avoid duplicate)
+    // broadcast playerJoined to others (exclude joining client)
     broadcastToRoomExcept(roomId, { type: 'playerJoined', room: roomId, player: { id: ws._id, name, ready: false, score: 0 } }, ws._id);
 
-    // update lobby counts globally
     broadcastLobbyCounts();
     return;
   }
@@ -161,18 +144,12 @@ function handleMessage(ws, data) {
     if (!roomId) return;
     const room = lobbies[roomId];
     if (!room) return;
-
     room.players.delete(ws._id);
     ws._room = null;
-
-    // notify remaining players (exclude leaving client)
     broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
     broadcastLobbyCounts();
-
-    if (room.players.size === 0) {
-      delete lobbies[roomId];
-      broadcastLobbyCounts();
-    } else if (room.hostId === ws._id) {
+    if (room.players.size === 0) delete lobbies[roomId];
+    else if (room.hostId === ws._id) {
       room.hostId = room.players.keys().next().value;
       broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
     }
@@ -202,61 +179,67 @@ function handleMessage(ws, data) {
     if (room.hostId !== ws._id) { send(ws, { type: 'error', message: 'Only host can start' }); return; }
     if (room.players.size < 3) { send(ws, { type: 'error', message: 'Need at least 3 players' }); return; }
 
-    // initialize round
+    // initialize game
     room.started = true;
     room.word = WORDS[Math.floor(Math.random() * WORDS.length)];
     const ids = Array.from(room.players.keys());
     room.impostorId = ids[Math.floor(Math.random() * ids.length)];
-    room.firstClueGiverId = ids[Math.floor(Math.random() * ids.length)];
-    room.clues = [];
+    room.clues = new Map();
     room.votesByVoter = new Map();
-    room.phase = 'clue';
+    room.phase = 'reveal';
+    room.alive = {};
+    room.scores = {};
+    ids.forEach(id => { room.alive[id] = true; room.scores[id] = room.players.get(id).score || 0; });
 
-    // build roles array (role text is either 'IMPOSTOR' or the secret word)
+    // build roles array
     const roles = ids.map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
 
-    // broadcast gameStarted (clients will display only their own role)
+    // broadcast gameStarted (clients will reveal their own role)
     broadcastToRoom(roomId, {
       type: 'gameStarted',
       roles,
-      firstClueGiverId: room.firstClueGiverId,
-      seconds: CLUE_SECONDS,
-      playersCount: room.players.size
+      revealSeconds: REVEAL_SECONDS,
+      seconds: CLUE_SECONDS
     });
+
+    // after reveal, start first round
+    setTimeout(() => {
+      startRound(roomId);
+    }, REVEAL_SECONDS * 1000 + 200);
 
     return;
   }
 
-  if (type === 'clue') {
+  if (type === 'submitClue') {
     const roomId = ws._room;
     if (!roomId) return;
     const room = lobbies[roomId];
-    if (!room) return;
+    if (!room || !room.started) return;
+    if (!room.alive[ws._id]) { send(ws, { type: 'error', message: 'You are not allowed to submit' }); return; }
     if (room.phase !== 'clue') { send(ws, { type: 'error', message: 'Not in clue phase' }); return; }
-    if (ws._id !== room.firstClueGiverId) { send(ws, { type: 'error', message: 'Not your turn to give a clue' }); return; }
 
     const text = (data.text || '').slice(0, 200);
-    room.clues.push({ from: ws._id, text });
+    room.clues.set(ws._id, text);
 
-    // broadcast the clue to everyone (including the clue-giver)
-    broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.clues.length, total: 1 });
+    // broadcast clueReceived to all (clues are visible)
+    broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.clues.size, total: countAlive(room) });
 
-    // move to discussion -> voting automatically
-    room.phase = 'discussion';
-
-    // small delay to ensure clients process the clue
-    setTimeout(() => {
-      broadcastToRoom(roomId, { type: 'cluePhaseEnded' });
-      broadcastToRoom(roomId, { type: 'discussionStarted', seconds: DISCUSSION_SECONDS });
-
-      // after discussion, start voting
+    // if all alive players submitted, move to voting
+    if (room.clues.size >= countAlive(room)) {
+      broadcastToRoom(roomId, { type: 'allCluesSubmitted' });
+      // small delay then start voting
       setTimeout(() => {
         room.phase = 'vote';
-        broadcastToRoom(roomId, { type: 'votingStarted', seconds: VOTE_SECONDS });
-      }, DISCUSSION_SECONDS * 1000);
-
-    }, 800);
-
+        room.votesByVoter = new Map();
+        broadcastToRoom(roomId, { type: 'votingStarted', players: alivePlayersArray(room), seconds: VOTE_SECONDS });
+        // set a timeout to auto-tally if not all votes in
+        setTimeout(() => {
+          if (room.phase === 'vote') {
+            tallyVotesAndProceed(roomId);
+          }
+        }, VOTE_SECONDS * 1000 + 200);
+      }, 600);
+    }
     return;
   }
 
@@ -264,83 +247,147 @@ function handleMessage(ws, data) {
     const roomId = ws._room;
     if (!roomId) return;
     const room = lobbies[roomId];
-    if (!room) return;
+    if (!room || !room.started) return;
+    if (!room.alive[ws._id]) { send(ws, { type: 'error', message: 'You are not allowed to vote' }); return; }
     if (room.phase !== 'vote') { send(ws, { type: 'error', message: 'Not in voting phase' }); return; }
 
     const votedId = data.votedId;
-    if (!room.players.has(votedId)) { send(ws, { type: 'error', message: 'Invalid vote target' }); return; }
+    if (!room.players.has(votedId) || !room.alive[votedId]) { send(ws, { type: 'error', message: 'Invalid vote target' }); return; }
 
-    // record or update vote
     room.votesByVoter.set(ws._id, votedId);
     send(ws, { type: 'voteReceived', from: ws._id });
 
-    // if all players have voted, tally immediately
-    if (room.votesByVoter.size >= room.players.size) {
-      // tally
-      const tally = {};
-      for (const voted of room.votesByVoter.values()) tally[voted] = (tally[voted] || 0) + 1;
-
-      // compute who voted for impostor (we can award points to voters who voted correctly)
-      const impostorId = room.impostorId;
-      const votersWhoPickedImpostor = [];
-      for (const [voter, voted] of room.votesByVoter.entries()) {
-        if (voted === impostorId) votersWhoPickedImpostor.push(voter);
-      }
-
-      // scoring:
-      // - each voter who correctly picked the impostor gets +1
-      // - if nobody picked the impostor, impostor gets +1
-      if (votersWhoPickedImpostor.length > 0) {
-        for (const voterId of votersWhoPickedImpostor) {
-          const p = room.players.get(voterId);
-          if (p) p.score = (p.score || 0) + 1;
-        }
-      } else {
-        const imp = room.players.get(impostorId);
-        if (imp) imp.score = (imp.score || 0) + 1;
-      }
-
-      // prepare results array
-      const results = [];
-      for (const [id, p] of room.players) {
-        results.push({
-          id,
-          name: p.name,
-          votes: tally[id] || 0,
-          wasImpostor: id === impostorId,
-          score: p.score || 0
-        });
-      }
-
-      // broadcast round results
-      broadcastToRoom(roomId, { type: 'roundResults', results });
-
-      // end of game for this simple server: send gameOver with standings
-      const standings = Array.from(room.players.values())
-        .sort((a, b) => (b.score || 0) - (a.score || 0))
-        .map(p => ({ id: p.id, name: p.name, score: p.score || 0 }));
-
-      setTimeout(() => {
-        broadcastToRoom(roomId, { type: 'gameOver', standings });
-
-        // reset lobby state for next game
-        room.started = false;
-        room.word = null;
-        room.impostorId = null;
-        room.firstClueGiverId = null;
-        room.clues = [];
-        room.votesByVoter = new Map();
-        room.phase = 'lobby';
-        // reset ready flags (players keep their scores)
-        for (const [, p] of room.players) p.ready = false;
-        broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
-      }, 1200);
+    // if all alive players voted, tally
+    if (room.votesByVoter.size >= countAlive(room)) {
+      tallyVotesAndProceed(roomId);
     }
-
     return;
   }
 
   // unknown type -> ignore
+}
+
+function countAlive(room) {
+  return Object.values(room.alive || {}).filter(Boolean).length;
+}
+
+function alivePlayersArray(room) {
+  return Array.from(room.players.values()).filter(p => room.alive[p.id]).map(p => ({ id: p.id, name: p.name }));
+}
+
+function startRound(roomId) {
+  const room = lobbies[roomId];
+  if (!room) return;
+  room.phase = 'clue';
+  room.clues = new Map();
+  room.votesByVoter = new Map();
+  // broadcast roundStarted with alive map
+  broadcastToRoom(roomId, {
+    type: 'roundStarted',
+    seconds: CLUE_SECONDS,
+    alive: room.alive
+  });
+
+  // set a timeout to auto-move to voting if not all clues in
+  setTimeout(() => {
+    if (room.phase === 'clue') {
+      // proceed to voting even if some didn't submit
+      room.phase = 'vote';
+      broadcastToRoom(roomId, { type: 'votingStarted', players: alivePlayersArray(room), seconds: VOTE_SECONDS });
+      // auto-tally after vote seconds
+      setTimeout(() => {
+        if (room.phase === 'vote') tallyVotesAndProceed(roomId);
+      }, VOTE_SECONDS * 1000 + 200);
+    }
+  }, CLUE_SECONDS * 1000 + 200);
+}
+
+function tallyVotesAndProceed(roomId) {
+  const room = lobbies[roomId];
+  if (!room) return;
+  room.phase = 'results';
+
+  // tally votes
+  const tally = {};
+  for (const voted of room.votesByVoter.values()) tally[voted] = (tally[voted] || 0) + 1;
+
+  // if no votes, choose random alive to eject
+  let ejectId = null;
+  if (Object.keys(tally).length === 0) {
+    const aliveIds = Object.keys(room.alive).filter(id => room.alive[id]);
+    ejectId = aliveIds[Math.floor(Math.random() * aliveIds.length)];
+  } else {
+    // find max
+    let max = -1;
+    let top = [];
+    for (const id in tally) {
+      if (tally[id] > max) { max = tally[id]; top = [id]; }
+      else if (tally[id] === max) top.push(id);
+    }
+    // tie-breaker random among top
+    ejectId = top[Math.floor(Math.random() * top.length)];
+  }
+
+  const wasImpostor = ejectId === room.impostorId;
+  // mark ejected
+  room.alive[ejectId] = false;
+
+  // scoring: voters who picked impostor get +1; if nobody picked impostor, impostor gets +1
+  const votersWhoPickedImpostor = [];
+  for (const [voter, voted] of room.votesByVoter.entries()) {
+    if (voted === room.impostorId) votersWhoPickedImpostor.push(voter);
+  }
+  if (votersWhoPickedImpostor.length > 0) {
+    votersWhoPickedImpostor.forEach(voterId => { room.scores[voterId] = (room.scores[voterId] || 0) + 1; });
+  } else {
+    room.scores[room.impostorId] = (room.scores[room.impostorId] || 0) + 1;
+  }
+
+  // prepare results array
+  const results = [];
+  for (const [id, p] of room.players) {
+    results.push({
+      id,
+      name: p.name,
+      votes: tally[id] || 0,
+      wasImpostor: id === room.impostorId,
+      score: room.scores[id] || 0
+    });
+    // update stored player score
+    p.score = room.scores[id] || p.score;
+  }
+
+  // broadcast round results and ejection
+  broadcastToRoom(roomId, { type: 'roundResults', results });
+  broadcastToRoom(roomId, { type: 'playerEjected', id: ejectId, wasImpostor });
+
+  // check end conditions
+  const aliveCount = countAlive(room);
+  if (wasImpostor || aliveCount <= 2) {
+    // game over
+    const standings = Array.from(room.players.values())
+      .sort((a, b) => (room.scores[b.id] || 0) - (room.scores[a.id] || 0))
+      .map(p => ({ id: p.id, name: p.name, score: room.scores[p.id] || 0 }));
+    setTimeout(() => {
+      broadcastToRoom(roomId, { type: 'gameOver', standings });
+      // reset lobby state
+      room.started = false;
+      room.word = null;
+      room.impostorId = null;
+      room.clues = new Map();
+      room.votesByVoter = new Map();
+      room.phase = 'lobby';
+      room.alive = {};
+      // reset ready flags
+      for (const [, p] of room.players) p.ready = false;
+      broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
+    }, 1200);
+  } else {
+    // continue next round after short delay
+    setTimeout(() => {
+      startRound(roomId);
+    }, 1500);
+  }
 }
 
 // start server
