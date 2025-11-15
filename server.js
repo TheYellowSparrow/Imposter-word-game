@@ -1,470 +1,606 @@
-// server.js
-// Imposer Word game server with turn-based clue entry
-// - Players take turns entering their clue/word.
-// - One random player is chosen to go first; order follows the lobby player list.
-// - Server enforces turn order, per-turn timeout, and advances automatically.
-// - When all alive players have had a turn (submitted or timed out), voting starts.
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Impostor Word — Client (Turn-based)</title>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@700&family=Poppins:wght@400;600;700&display=swap" rel="stylesheet">
+  <style>
+    :root{ --bg1:#05021a; --bg2:#081033; --accent:#E91E63; --accent-2:#2196F3; --muted:rgba(255,255,255,0.85);
+      --card: rgba(255,255,255,0.06); --glass: rgba(255,255,255,0.04); --success:#2ecc71; --danger:#ff6b6b; }
+    html,body{height:100%;margin:0;background:radial-gradient(ellipse at bottom, rgba(255,255,255,0.02) 0%, transparent 40%), linear-gradient(180deg,var(--bg1),var(--bg2));color:#fff;font-family:'Poppins',system-ui,-apple-system,sans-serif;overflow:hidden}
+    body::before{content:"";position:fixed;inset:0;background-image:
+      radial-gradient(1px 1px at 10% 20%, rgba(255,255,255,0.9) 50%, transparent 51%),
+      radial-gradient(1px 1px at 30% 40%, rgba(255,255,255,0.7) 50%, transparent 51%),
+      radial-gradient(1px 1px at 70% 10%, rgba(255,255,255,0.6) 50%, transparent 51%),
+      radial-gradient(1px 1px at 80% 70%, rgba(255,255,255,0.8) 50%, transparent 51%),
+      radial-gradient(1px 1px at 50% 80%, rgba(255,255,255,0.6) 50%, transparent 51%);opacity:0.9;pointer-events:none;z-index:0;}
+    .topbar{position:fixed;top:0;left:0;right:0;height:64px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;padding:0 24px;background:linear-gradient(180deg, rgba(0,0,0,0.35), rgba(0,0,0,0));backdrop-filter: blur(6px);z-index:10000}
+    .brand{grid-column:1;justify-self:start;font-family:'Fredoka',Poppins,sans-serif;font-size:26px;font-weight:900}
+    .center-area{grid-column:2;justify-self:center;display:flex;align-items:center;gap:12px}
+    .status{grid-column:3;justify-self:end;display:flex;align-items:center;gap:10px;color:var(--muted);font-size:14px}
+    .dot{width:12px;height:12px;border-radius:50%;background:#b33}.dot.green{background:#2ecc71}.dot.yellow{background:#ffd166}
+    .displayname{width:320px;padding:10px 12px;border-radius:10px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:#fff;font-size:15px}
+    .role-box{position:fixed;top:70px;left:20px;background:rgba(255,255,255,0.08);color:#fff;padding:10px 14px;border-radius:8px;font-weight:900;font-size:18px;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,0.4)}
+    .hidden{display:none!important}
+    .screen{position:fixed;inset:64px 0 0 0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:1}
+    .lobby-wrap{max-width:1000px;width:100%;display:flex;flex-direction:column;gap:20px;z-index:2}
+    .lobby-buttons{display:grid;grid-template-columns:repeat(2,minmax(240px,1fr));gap:16px}
+    .big-btn{height:96px;border:none;border-radius:14px;cursor:pointer;background:linear-gradient(135deg,var(--accent),#C2185B);color:#071021;font-weight:900;font-size:24px;box-shadow:0 18px 60px rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center}
+    .panel{background: var(--card);border-radius:16px;padding:16px;box-shadow:0 18px 60px rgba(0,0,0,0.45)}
+    .players{display:flex;flex-direction:column;gap:10px;max-height:240px;overflow:auto}
+    .player{display:flex;align-items:center;gap:12px;padding:10px;border-radius:12px;background:var(--glass)}
+    .name{font-weight:900}
+    .meta{margin-left:auto;display:flex;gap:10px;align-items:center}
+    .badge{padding:6px 10px;border-radius:999px;font-weight:900;background:#ffd54f;color:#071021;font-size:12px}
+    .ready{background:#4caf50}.notready{background:#ffb86b}.score{font-weight:900;color:var(--accent)}
+    .controls{display:flex;gap:10px}
+    button.action{background:linear-gradient(135deg,var(--accent-2),#1976D2);border:none;color:#071021;padding:12px 14px;border-radius:12px;font-weight:800;cursor:pointer;font-size:15px}
+    .game-wrap{max-width:1200px;width:100%;display:flex;flex-direction:column;gap:18px;z-index:2}
+    .reveal-card{background: rgba(255,255,255,0.06);border-radius:14px;padding:28px;text-align:center;box-shadow:0 18px 60px rgba(0,0,0,0.45)}
+    .role-text{font-family:'Fredoka',Poppins,sans-serif;font-size:36px;font-weight:900}
+    .space-stage{width:100%;display:flex;flex-direction:column;gap:12px;align-items:center}
+    .players-grid{display:flex;flex-wrap:wrap;gap:12px;justify-content:center;width:100%}
+    .player-card{width:220px;background:rgba(255,255,255,0.04);border-radius:12px;padding:12px;display:flex;flex-direction:column;align-items:center;gap:8px;box-shadow:0 10px 30px rgba(0,0,0,0.45);position:relative}
+    .player-card.turn { box-shadow:0 0 0 3px rgba(33,150,243,0.18); border:1px solid rgba(33,150,243,0.25); }
+    .pfp{width:72px;height:72px;border-radius:999px;background:linear-gradient(180deg,#fff,#eee);display:flex;align-items:center;justify-content:center;color:#081033;font-size:36px}
+    .player-name{font-weight:800}
+    .clue-box{width:100%;margin-top:6px}
+    .clue-input{width:100%;padding:8px;border-radius:8px;border:2px solid rgba(255,255,255,0.06);background:transparent;color:#fff;font-size:14px}
+    .clue-submit{margin-top:6px;background:linear-gradient(135deg,var(--accent),#C2185B);border:none;color:#071021;padding:8px 10px;border-radius:8px;font-weight:800;cursor:pointer}
+    .clue-text{width:100%;padding:8px;border-radius:8px;background:rgba(0,0,0,0.12);font-size:14px;color:var(--muted);text-align:center}
+    .voting-list{display:flex;flex-direction:column;gap:8px;max-width:480px;width:100%}
+    .vote-btn{padding:10px;border-radius:10px;background:linear-gradient(135deg,#fff,#eee);color:#081033;font-weight:900;border:none;cursor:pointer}
+    .vote-btn.disabled{opacity:0.6;cursor:not-allowed}
+    .spectator{opacity:0.45}
+    .round-info{color:var(--muted);font-size:14px}
+    .results-list{display:flex;flex-direction:column;gap:8px;max-width:640px;width:100%}
+    .result-item{padding:10px;border-radius:10px;background:rgba(255,255,255,0.04)}
+    @media (max-width:900px){.lobby-buttons{grid-template-columns:1fr}.displayname{width:220px}.player-card{width:160px}}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">Impostor Word</div>
+    <div class="center-area">
+      <input id="displayNameTop" class="displayname" type="text" placeholder="Your display name" />
+    </div>
+    <div class="status">
+      <div class="dot" id="connDot"></div>
+      <div id="connText">Connecting…</div>
+    </div>
+  </div>
 
-const http = require('http');
-const WebSocket = require('ws');
-const crypto = require('crypto');
+  <!-- Persistent role box (top-left) -->
+  <div id="roleBox" class="role-box hidden"></div>
 
-const PORT = process.env.PORT || 8080;
-const REVEAL_SECONDS = 5;
-const CLUE_SECONDS = 30; // per-turn seconds
-const VOTE_SECONDS = 30;
+  <div id="lobbyScreen" class="screen">
+    <!-- ... lobby markup unchanged ... -->
+    <div class="lobby-wrap">
+      <div style="font-size:20px;color:var(--muted)">Choose a lobby, ready up, host presses Start</div>
+      <div class="lobby-buttons" id="lobbyButtons"></div>
+      <div class="panel">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div style="font-weight:900" id="currentLobbyTitle">Lobby — not joined</div>
+          <div style="display:flex;gap:10px;align-items:center;">
+            <div style="color:var(--muted)">Players</div>
+            <div id="playerCount" style="color:var(--muted)">0 / 8</div>
+          </div>
+        </div>
+        <div class="players" id="playersList" aria-live="polite"></div>
+        <div class="controls" style="margin-top:12px">
+          <button id="readyBtn" class="action" disabled>Ready</button>
+          <button id="unreadyBtn" class="action" disabled>Unready</button>
+          <button id="startBtn" class="action" disabled>Start (Host)</button>
+          <button id="leaveBtn" class="action" disabled style="margin-left:auto">Leave</button>
+        </div>
+        <div id="lobbyHint" style="color:var(--muted);margin-top:8px">Host starts when everyone is ready</div>
+      </div>
+    </div>
+  </div>
 
-const WORDS = [
-  'apple','ocean','mountain','piano','rocket','coffee','forest','castle',
-  'river','guitar','banana','dragon','island','mirror','sunset','planet'
-];
+  <div id="gameScreen" class="screen hidden">
+    <div class="game-wrap">
+      <div id="revealScreen" class="reveal-card">
+        <div style="color:var(--muted);font-size:14px">Your role</div>
+        <div id="roleReveal" class="role-text">...</div>
+        <div style="margin-top:12px;color:var(--muted)">Revealing roles…</div>
+      </div>
 
-const lobbies = {};
+      <div id="spaceStage" class="space-stage hidden">
+        <div style="display:flex;align-items:center;gap:12px;width:100%;justify-content:space-between">
+          <div class="round-info" id="roundInfo">Round</div>
+          <div class="round-info" id="timerDisplay">30</div>
+        </div>
 
-function makeId() { return crypto.randomBytes(6).toString('hex'); }
-function send(ws, obj) { try { ws.send(JSON.stringify(obj)); } catch (e) {} }
-function broadcastToRoom(roomId, obj) {
-  const room = lobbies[roomId];
-  if (!room) return;
-  for (const [, p] of room.players) send(p.ws, obj);
-}
-function broadcastToRoomExcept(roomId, obj, excludeId) {
-  const room = lobbies[roomId];
-  if (!room) return;
-  for (const [, p] of room.players) {
-    if (p.id === excludeId) continue;
-    send(p.ws, obj);
-  }
-}
-function broadcastLobbyCounts() {
-  const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
-  wss.clients.forEach(c => {
-    if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
-  });
-}
+        <div class="players-grid" id="playersGrid"></div>
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Impostor Word server\n');
-});
+        <div id="clueStatus" class="round-info" style="margin-top:8px">Waiting for turn</div>
 
-const wss = new WebSocket.Server({ server });
+        <div id="votingArea" class="hidden" style="margin-top:12px">
+          <div style="color:var(--muted);font-size:16px;margin-bottom:8px">Vote for the player you think is the impostor</div>
+          <div class="voting-list" id="votingPlayersList"></div>
+          <div id="votingStatus" style="color:var(--muted);margin-top:8px">Waiting for votes</div>
+        </div>
 
-wss.on('connection', (ws) => {
-  const id = makeId();
-  ws._id = id;
-  ws._room = null;
-  ws._name = null;
-  ws._ready = false;
-  ws._score = 0;
+        <div id="resultsArea" class="hidden" style="margin-top:12px">
+          <div style="color:var(--muted);font-size:16px;margin-bottom:8px">Round results</div>
+          <div class="results-list" id="resultsList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
 
-  // send assigned id immediately
-  send(ws, { type: 'id', id });
+  <div id="finalScreen" class="screen hidden">
+    <div class="finalcol center" style="z-index:2">
+      <div style="font-weight:900;font-size:26px">Game Over</div>
+      <div id="finalStandings" class="list" style="width:100%"></div>
+      <button id="backToLobbyBtn" class="submitbtn" style="margin-top:12px">Back to Lobby</button>
+    </div>
+  </div>
 
-  ws.on('message', (raw) => {
-    let data;
-    try { data = JSON.parse(raw); } catch (e) { return; }
-    handleMessage(ws, data);
-  });
+  <script>
+  (function(){
+    const SERVER_WS = 'https://imposter-word-game.onrender.com';
+    const REVEAL_SECONDS = 5;
+    const CLUE_SECONDS = 30;
+    const VOTE_SECONDS = 30;
 
-  ws.on('close', () => {
-    if (!ws._room) return;
-    const roomId = ws._room;
-    const room = lobbies[roomId];
-    if (!room) return;
+    // Elements
+    const roleBox = document.getElementById('roleBox');
+    const connDot = document.getElementById('connDot');
+    const connText = document.getElementById('connText');
+    const displayNameTop = document.getElementById('displayNameTop');
 
-    // remove player
-    room.players.delete(ws._id);
-    if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
-    if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
+    const lobbyScreen = document.getElementById('lobbyScreen');
+    const gameScreen = document.getElementById('gameScreen');
+    const finalScreen = document.getElementById('finalScreen');
 
-    // if the player was in the current turn, advance
-    if (room.started && room.currentTurnId === ws._id) {
-      clearTurnTimeout(room);
-      advanceTurn(roomId);
+    const lobbyButtonsEl = document.getElementById('lobbyButtons');
+    const currentLobbyTitle = document.getElementById('currentLobbyTitle');
+    const playersListEl = document.getElementById('playersList');
+    const playerCountEl = document.getElementById('playerCount');
+    const readyBtn = document.getElementById('readyBtn');
+    const unreadyBtn = document.getElementById('unreadyBtn');
+    const startBtn = document.getElementById('startBtn');
+    const leaveBtn = document.getElementById('leaveBtn');
+    const lobbyHint = document.getElementById('lobbyHint');
+
+    const revealScreen = document.getElementById('revealScreen');
+    const roleReveal = document.getElementById('roleReveal');
+
+    const spaceStage = document.getElementById('spaceStage');
+    const playersGrid = document.getElementById('playersGrid');
+    const timerDisplay = document.getElementById('timerDisplay');
+    const roundInfo = document.getElementById('roundInfo');
+    const clueStatus = document.getElementById('clueStatus');
+
+    const votingArea = document.getElementById('votingArea');
+    const votingPlayersList = document.getElementById('votingPlayersList');
+    const votingStatus = document.getElementById('votingStatus');
+
+    const resultsArea = document.getElementById('resultsArea');
+    const resultsList = document.getElementById('resultsList');
+
+    const finalStandings = document.getElementById('finalStandings');
+    const backToLobbyBtn = document.getElementById('backToLobbyBtn');
+
+    // State
+    let socket = null;
+    let myId = null;
+    let currentRoom = null;
+    let players = []; // {id,name,ready,score,alive}
+    let hostId = null;
+    let hasJoined = false;
+
+    let phase = 'lobby';
+    let timerInterval = null;
+    let roundSeconds = 0;
+
+    // Game state
+    let rolesMap = {}; // id -> 'IMPOSTOR' or word
+    let impostorId = null;
+    let secretWord = '';
+    let submittedClues = {}; // id -> text
+    let aliveMap = {}; // id -> boolean
+    let isSpectator = false;
+    let currentTurnId = null;
+
+    const lobbyButtonsMap = new Map();
+    const lobbyCounts = { lobby1:0, lobby2:0, lobby3:0, lobby4:0 };
+
+    // Helpers
+    function setConnState(text, colorClass){ connText.textContent = text; connDot.className = 'dot ' + (colorClass || ''); }
+    function normalizeWs(url){
+      if (!url) return '';
+      if (url.startsWith('ws://') || url.startsWith('wss://')) return url;
+      if (url.startsWith('http://')) return 'ws://' + url.slice(7);
+      if (url.startsWith('https://')) return 'wss://' + url.slice(8);
+      return 'wss://' + url;
+    }
+    function send(obj){ if (!socket || socket.readyState !== WebSocket.OPEN) return; try { socket.send(JSON.stringify(obj)); } catch(e){} }
+    function escapeHtml(s){ return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+    function updateLobbyButtonCount(roomId, count){
+      lobbyCounts[roomId] = Math.max(0, count);
+      const btn = lobbyButtonsMap.get(roomId);
+      if (btn){ const cnt = btn.querySelector('.count'); if (cnt) cnt.textContent = `${lobbyCounts[roomId]}/8`; }
+      if (currentRoom === roomId) playerCountEl.textContent = `${lobbyCounts[roomId]} / 8`;
     }
 
-    broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
-    broadcastLobbyCounts();
-
-    if (room.hostId === ws._id) {
-      const next = room.players.keys().next();
-      room.hostId = next.done ? null : next.value;
-      broadcastToRoom(roomId, { type: 'hostChanged', hostId: room.hostId });
-      broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
+    function updateStartButton(){
+      const enabled = !!(hasJoined && myId && hostId && hostId === myId);
+      startBtn.disabled = !enabled;
+      if (enabled) lobbyHint.textContent = 'You are host — press Start to begin';
+      else if (hasJoined) lobbyHint.textContent = 'Host starts when everyone is ready';
     }
 
-    if (room.players.size === 0) {
-      delete lobbies[roomId];
-      broadcastLobbyCounts();
+    function showLobby(){ lobbyScreen.classList.remove('hidden'); gameScreen.classList.add('hidden'); finalScreen.classList.add('hidden'); }
+    function showGame(){ lobbyScreen.classList.add('hidden'); gameScreen.classList.remove('hidden'); finalScreen.classList.add('hidden'); }
+    function showFinal(){ lobbyScreen.classList.add('hidden'); gameScreen.classList.add('hidden'); finalScreen.classList.remove('hidden'); }
+    function setPhase(newPhase){ phase = newPhase; roundInfo.textContent = newPhase.charAt(0).toUpperCase() + newPhase.slice(1); }
+
+    function enableLobbyControls(enabled){
+      readyBtn.disabled = !enabled;
+      unreadyBtn.disabled = !enabled;
+      leaveBtn.disabled = !enabled;
+      updateStartButton();
     }
-  });
-});
 
-function handleMessage(ws, data) {
-  const type = data.type;
+    function startTimer(seconds){
+      stopTimer();
+      roundSeconds = seconds || 60;
+      timerDisplay.textContent = roundSeconds;
+      timerInterval = setInterval(() => {
+        roundSeconds--;
+        timerDisplay.textContent = roundSeconds;
+        if (roundSeconds <= 0) stopTimer();
+      }, 1000);
+    }
+    function stopTimer(){ if (timerInterval){ clearInterval(timerInterval); timerInterval = null; } }
 
-  if (type === 'listLobbies') {
-    const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
-    send(ws, { type: 'lobbyList', lobbies: arr });
-    return;
-  }
-
-  if (type === 'join') {
-    const roomId = data.room;
-    const name = (data.name || 'Player').slice(0, 32);
-    if (!roomId) { send(ws, { type: 'error', message: 'Missing room' }); return; }
-
-    if (!lobbies[roomId]) {
-      lobbies[roomId] = {
-        players: new Map(),
-        hostId: null,
-        started: false,
-        word: null,
-        impostorId: null,
-        clues: new Map(),
-        votesByVoter: new Map(),
-        phase: 'lobby',
-        alive: {},
-        scores: {},
-        // turn-related
-        turnOrder: [],
-        currentTurnIndex: 0,
-        currentTurnId: null,
-        submittedSet: new Set(),
-        turnTimeout: null
+    function connect(){
+      if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+      setConnState('Connecting…','yellow');
+      try { socket = new WebSocket(normalizeWs(SERVER_WS)); } catch(err){ setConnState('Connection failed',''); return; }
+      socket.onopen = () => { setConnState('Connected','green'); send({ type: 'listLobbies' }); };
+      socket.onmessage = (ev) => { let data; try { data = JSON.parse(ev.data); } catch(e){ return; } handleServerMessage(data); };
+      socket.onclose = () => {
+        hasJoined = false; myId = null;
+        setConnState('Disconnected','');
+        players = []; hostId = null; currentRoom = null;
+        enableLobbyControls(false);
+        showLobby();
       };
-    }
-    const room = lobbies[roomId];
-    if (room.players.size >= 8) { send(ws, { type: 'error', message: 'Lobby full' }); return; }
-
-    ws._room = roomId;
-    ws._name = name;
-    ws._ready = false;
-    ws._score = 0;
-
-    room.players.set(ws._id, { ws, id: ws._id, name, ready: false, score: 0 });
-
-    // ensure alive and scores entries exist for this player
-    room.alive[ws._id] = true;
-    room.scores[ws._id] = room.scores[ws._id] || 0;
-
-    if (!room.hostId) room.hostId = ws._id;
-
-    const playersArr = Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, ready: p.ready, score: p.score }));
-    send(ws, { type: 'joined', room: roomId, hostId: room.hostId, players: playersArr });
-
-    broadcastToRoomExcept(roomId, { type: 'playerJoined', room: roomId, player: { id: ws._id, name, ready: false, score: 0 } }, ws._id);
-    broadcastLobbyCounts();
-    return;
-  }
-
-  if (type === 'leave') {
-    const roomId = data.room || ws._room;
-    if (!roomId) return;
-    const room = lobbies[roomId];
-    if (!room) return;
-
-    room.players.delete(ws._id);
-    ws._room = null;
-    if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
-    if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
-
-    if (room.started && room.currentTurnId === ws._id) {
-      clearTurnTimeout(room);
-      advanceTurn(roomId);
+      socket.onerror = () => { setConnState('Connection error',''); };
     }
 
-    broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
-    broadcastLobbyCounts();
+    function handleServerMessage(data){
+      if (!data || typeof data.type !== 'string') return;
+      switch (data.type) {
+        case 'id':
+          myId = data.id;
+          if (hasJoined) { renderPlayers(); enableLobbyControls(true); updateStartButton(); renderPlayersGrid(); }
+          break;
 
-    if (room.players.size === 0) {
-      delete lobbies[roomId];
-      broadcastLobbyCounts();
-    } else if (room.hostId === ws._id) {
-      room.hostId = room.players.keys().next().value;
-      broadcastToRoom(roomId, { type: 'hostChanged', hostId: room.hostId });
-      broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
+        case 'lobbyList':
+          if (Array.isArray(data.lobbies)) data.lobbies.forEach(l => updateLobbyButtonCount(l.id, l.count || 0));
+          break;
+
+        case 'lobbyInfo':
+          if (data.room) updateLobbyButtonCount(data.room, data.count || 0);
+          break;
+
+        case 'hostChanged':
+          hostId = data.hostId || hostId;
+          updateStartButton();
+          break;
+
+        case 'joined':
+          hasJoined = true;
+          currentRoom = data.room;
+          hostId = data.hostId;
+          players = (data.players || []).map(p => ({ ...p, alive: true }));
+          currentLobbyTitle.textContent = 'Lobby ' + currentRoom;
+          playerCountEl.textContent = players.length + ' / 8';
+          updateLobbyButtonCount(currentRoom, players.length);
+          renderPlayers();
+          enableLobbyControls(true);
+          updateStartButton();
+          showLobby();
+          break;
+
+        case 'playerJoined':
+          if (data.room) updateLobbyButtonCount(data.room, (lobbyCounts[data.room]||0) + 1);
+          if (!currentRoom) break;
+          if (players.some(p => p.id === data.player.id)) break;
+          players.push({ id: data.player.id, name: data.player.name, ready: !!data.player.ready, score: data.player.score || 0, alive: true });
+          playerCountEl.textContent = players.length + ' / 8';
+          renderPlayers();
+          break;
+
+        case 'playerLeft':
+          if (data.room) updateLobbyButtonCount(data.room, Math.max(0, (lobbyCounts[data.room]||0) - 1));
+          if (!currentRoom) break;
+          players = players.filter(p => p.id !== data.id);
+          playerCountEl.textContent = players.length + ' / 8';
+          if (hostId === data.id) hostId = players.length ? players[0].id : null;
+          renderPlayers();
+          updateStartButton();
+          break;
+
+        case 'playerReady':
+          { const p = players.find(x => x.id === data.id); if (p) p.ready = true; renderPlayers(); }
+          break;
+
+        case 'playerUnready':
+          { const p = players.find(x => x.id === data.id); if (p) p.ready = false; renderPlayers(); }
+          break;
+
+        case 'allReady':
+          if (myId === hostId) lobbyHint.textContent = 'All players ready. You can start the game.';
+          break;
+
+        // Game flow
+        case 'gameStarted':
+          rolesMap = {}; secretWord = ''; impostorId = null;
+          submittedClues = {}; aliveMap = {}; isSpectator = false; currentTurnId = null;
+
+          if (Array.isArray(data.roles)) {
+            data.roles.forEach(r => { rolesMap[r.id] = r.role; if (r.role !== 'IMPOSTOR') secretWord = r.role; if (r.role === 'IMPOSTOR') impostorId = r.id; });
+          }
+          players.forEach(p => { p.alive = true; aliveMap[p.id] = true; });
+
+          const myRole = rolesMap[myId] || (myId === impostorId ? 'IMPOSTOR' : secretWord || '(word)');
+          roleReveal.textContent = myRole;
+          roleBox.textContent = (myRole === 'IMPOSTOR') ? 'Role: IMPOSTOR' : `Word: ${myRole}`;
+          roleBox.classList.remove('hidden');
+
+          revealScreen.classList.remove('hidden');
+          spaceStage.classList.add('hidden');
+          setPhase('reveal');
+          showGame();
+
+          setTimeout(() => {
+            revealScreen.classList.add('hidden');
+            spaceStage.classList.remove('hidden');
+            setPhase('clue-turns');
+          }, (data.revealSeconds || REVEAL_SECONDS) * 1000);
+          break;
+
+        case 'turnStarted':
+          currentTurnId = data.id;
+          clueStatus.textContent = (currentTurnId === myId) ? 'Your turn — enter your clue' : `Waiting: ${data.remaining} left`;
+          renderPlayersGrid();
+          startTimer(data.seconds || CLUE_SECONDS);
+          break;
+
+        case 'clueReceived':
+          if (data.from !== undefined) {
+            submittedClues[data.from] = data.text || '';
+            renderPlayersGrid();
+          }
+          if (data.count !== undefined && data.total !== undefined) {
+            clueStatus.textContent = `${data.count} / ${data.total} clues submitted`;
+          }
+          break;
+
+        case 'allCluesSubmitted':
+          currentTurnId = null;
+          clueStatus.textContent = 'All clues in — moving to voting';
+          break;
+
+        case 'votingStarted':
+          stopTimer();
+          setPhase('vote');
+          votingArea.classList.remove('hidden');
+          renderVotingPlayers(data.players || players.map(p => ({ id: p.id, name: p.name, alive: p.alive })));
+          startTimer(data.seconds || VOTE_SECONDS);
+          break;
+
+        case 'voteReceived':
+          if (data.from === myId) votingStatus.textContent = 'Vote recorded';
+          break;
+
+        case 'playerEjected':
+          const ejectedId = data.id;
+          const ejected = players.find(p => p.id === ejectedId);
+          if (ejected) { ejected.alive = false; aliveMap[ejectedId] = false; }
+          if (data.alive && typeof data.alive === 'object') {
+            Object.keys(data.alive).forEach(id => {
+              const p = players.find(x => x.id === id);
+              if (p) p.alive = !!data.alive[id];
+              aliveMap[id] = !!data.alive[id];
+            });
+          }
+          if (ejectedId === myId) { isSpectator = true; clueStatus.textContent = 'You were ejected — spectating'; }
+          renderPlayersGrid();
+          resultsArea.classList.remove('hidden');
+          resultsList.innerHTML = `<div class="result-item">${escapeHtml((ejected && ejected.name) || ejectedId)} was ejected ${data.wasImpostor ? '<strong style="color:#E91E63">and was the IMPOSTOR</strong>' : ''}</div>`;
+          break;
+
+        case 'roundResults':
+          resultsArea.classList.remove('hidden');
+          resultsList.innerHTML = '';
+          (data.results || []).forEach(r => {
+            const div = document.createElement('div');
+            div.className = 'result-item';
+            div.innerHTML = `<div style="font-weight:900">${escapeHtml(r.name)} <span style="color:#E91E63;margin-left:8px">${r.votes||0} votes</span></div>
+                             <div style="color:var(--muted);margin-top:6px">${r.wasImpostor ? 'Was the IMPOSTOR' : ''} Score: ${r.score||0}</div>`;
+            resultsList.appendChild(div);
+            const p = players.find(x => x.id === r.id); if (p) p.score = r.score || p.score;
+          });
+          renderPlayers();
+          break;
+
+        case 'gameOver':
+          roleBox.classList.add('hidden');
+          renderFinalStandings(data.standings || []);
+          showFinal();
+          stopTimer();
+          enableLobbyControls(true);
+          lobbyHint.textContent = 'Game finished. Ready up to start again.';
+          break;
+
+        case 'error':
+          alert(data.message || 'Server error');
+          break;
+      }
     }
-    return;
-  }
 
-  if (type === 'ready' || type === 'unready') {
-    const roomId = ws._room;
-    if (!roomId) return;
-    const room = lobbies[roomId];
-    if (!room) return;
-    const p = room.players.get(ws._id);
-    if (!p) return;
-    p.ready = (type === 'ready');
-    broadcastToRoom(roomId, { type: p.ready ? 'playerReady' : 'playerUnready', id: ws._id });
-
-    const allReady = Array.from(room.players.values()).every(x => x.ready);
-    if (allReady) broadcastToRoom(roomId, { type: 'allReady' });
-    return;
-  }
-
-  if (type === 'startGame') {
-    const roomId = ws._room;
-    if (!roomId) return;
-    const room = lobbies[roomId];
-    if (!room) return;
-    if (room.hostId !== ws._id) { send(ws, { type: 'error', message: 'Only host can start' }); return; }
-    if (room.players.size < 3) { send(ws, { type: 'error', message: 'Need at least 3 players' }); return; }
-
-    // initialize game
-    room.started = true;
-    room.word = WORDS[Math.floor(Math.random() * WORDS.length)];
-    const ids = Array.from(room.players.keys());
-    room.impostorId = ids[Math.floor(Math.random() * ids.length)];
-    room.clues = new Map();
-    room.votesByVoter = new Map();
-    room.phase = 'reveal';
-
-    // ensure alive and scores are set for all players
-    ids.forEach(id => {
-      room.alive[id] = true;
-      room.scores[id] = room.scores[id] || room.players.get(id).score || 0;
-    });
-
-    // build roles array
-    const roles = ids.map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
-
-    // broadcast gameStarted
-    broadcastToRoom(roomId, {
-      type: 'gameStarted',
-      roles,
-      revealSeconds: REVEAL_SECONDS,
-      seconds: CLUE_SECONDS
-    });
-
-    // prepare turn order and start first turn after reveal
-    setTimeout(() => {
-      // turn order follows insertion order of room.players
-      room.turnOrder = Array.from(room.players.keys());
-      // pick random start index
-      room.currentTurnIndex = Math.floor(Math.random() * room.turnOrder.length);
-      room.submittedSet = new Set();
-      room.currentTurnId = null;
-      room.phase = 'clue-turns';
-      startTurn(roomId);
-    }, REVEAL_SECONDS * 1000 + 200);
-
-    return;
-  }
-
-  if (type === 'submitClue') {
-    const roomId = ws._room;
-    if (!roomId) return;
-    const room = lobbies[roomId];
-    if (!room || !room.started) return;
-    if (!room.alive[ws._id]) { send(ws, { type: 'error', message: 'You are not allowed to submit' }); return; }
-    if (room.phase !== 'clue-turns') { send(ws, { type: 'error', message: 'Not in clue phase' }); return; }
-    if (room.currentTurnId !== ws._id) { send(ws, { type: 'error', message: 'Not your turn' }); return; }
-
-    const text = (data.text || '').slice(0, 200);
-    room.clues.set(ws._id, text);
-    room.submittedSet.add(ws._id);
-
-    // broadcast clueReceived
-    broadcastToRoom(roomId, { type: 'clueReceived', from: ws._id, text, count: room.submittedSet.size, total: countAlive(room) });
-
-    // clear current turn timeout and advance
-    clearTurnTimeout(room);
-    advanceTurn(roomId);
-    return;
-  }
-
-  if (type === 'voteImpostor') {
-    const roomId = ws._room;
-    if (!roomId) return;
-    const room = lobbies[roomId];
-    if (!room || !room.started) return;
-    if (!room.alive[ws._id]) { send(ws, { type: 'error', message: 'You are not allowed to vote' }); return; }
-    if (room.phase !== 'vote') { send(ws, { type: 'error', message: 'Not in voting phase' }); return; }
-
-    const votedId = data.votedId;
-    if (!room.players.has(votedId) || !room.alive[votedId]) { send(ws, { type: 'error', message: 'Invalid vote target' }); return; }
-
-    room.votesByVoter.set(ws._id, votedId);
-    send(ws, { type: 'voteReceived', from: ws._id });
-
-    if (room.votesByVoter.size >= countAlive(room)) {
-      tallyVotesAndProceed(roomId);
+    // Lobby actions
+    function joinLobby(roomId){
+      if (!socket || socket.readyState !== WebSocket.OPEN) { connect(); setTimeout(() => joinLobby(roomId), 150); return; }
+      if (hasJoined && currentRoom && currentRoom !== roomId) {
+        send({ type: 'leave', room: currentRoom });
+        hasJoined = false; players = []; hostId = null; enableLobbyControls(false);
+      }
+      const name = (displayNameTop.value || ('Player-' + Math.random().toString(36).slice(2,6))).trim();
+      currentRoom = roomId;
+      send({ type: 'join', room: roomId, name });
     }
-    return;
-  }
 
-  // unknown type -> ignore
-}
-
-// helpers for turn flow
-function clearTurnTimeout(room) {
-  if (!room) return;
-  if (room.turnTimeout) {
-    clearTimeout(room.turnTimeout);
-    room.turnTimeout = null;
-  }
-}
-
-function startTurn(roomId) {
-  const room = lobbies[roomId];
-  if (!room) return;
-
-  // if everyone already submitted, move to voting
-  if (room.submittedSet.size >= countAlive(room)) {
-    // all done
-    clearTurnTimeout(room);
-    room.phase = 'vote';
-    room.votesByVoter = new Map();
-    broadcastToRoom(roomId, { type: 'allCluesSubmitted' });
-    broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
-    // auto-tally after vote seconds
-    room.turnTimeout = setTimeout(() => {
-      if (room.phase === 'vote') tallyVotesAndProceed(roomId);
-    }, VOTE_SECONDS * 1000 + 200);
-    return;
-  }
-
-  // find next index that corresponds to an alive player who hasn't submitted yet
-  const n = room.turnOrder.length;
-  let attempts = 0;
-  while (attempts < n) {
-    const idx = room.currentTurnIndex % n;
-    const candidateId = room.turnOrder[idx];
-    // advance index until we find a valid candidate
-    if (room.alive[candidateId] && !room.submittedSet.has(candidateId)) {
-      room.currentTurnId = candidateId;
-      // notify clients whose turn it is
-      broadcastToRoom(roomId, { type: 'turnStarted', id: candidateId, seconds: CLUE_SECONDS, remaining: countAlive(room) - room.submittedSet.size });
-      // set per-turn timeout
-      clearTurnTimeout(room);
-      room.turnTimeout = setTimeout(() => {
-        // mark as skipped (count as submitted) and advance
-        room.submittedSet.add(candidateId);
-        broadcastToRoom(roomId, { type: 'clueReceived', from: candidateId, text: '', count: room.submittedSet.size, total: countAlive(room) });
-        room.currentTurnIndex = (room.currentTurnIndex + 1) % n;
-        startTurn(roomId);
-      }, CLUE_SECONDS * 1000);
-      return;
+    function leaveLobby(){
+      if (!hasJoined || !currentRoom) return;
+      const oldRoom = currentRoom;
+      send({ type: 'leave', room: oldRoom });
+      hasJoined = false; players = []; hostId = null; currentRoom = null;
+      currentLobbyTitle.textContent = 'Lobby — not joined';
+      playerCountEl.textContent = '0 / 8';
+      enableLobbyControls(false);
+      showLobby();
     }
-    room.currentTurnIndex = (room.currentTurnIndex + 1) % n;
-    attempts++;
-  }
 
-  // if we get here, no valid next turn found -> move to voting
-  room.phase = 'vote';
-  room.votesByVoter = new Map();
-  broadcastToRoom(roomId, { type: 'allCluesSubmitted' });
-  broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
-  room.turnTimeout = setTimeout(() => {
-    if (room.phase === 'vote') tallyVotesAndProceed(roomId);
-  }, VOTE_SECONDS * 1000 + 200);
-}
-
-function advanceTurn(roomId) {
-  const room = lobbies[roomId];
-  if (!room) return;
-  // advance index to next player in order
-  room.currentTurnIndex = (room.currentTurnIndex + 1) % (room.turnOrder.length || 1);
-  startTurn(roomId);
-}
-
-function countAlive(room) {
-  return Object.values(room.alive || {}).filter(Boolean).length;
-}
-
-function playersWithAlive(room) {
-  return Array.from(room.players.values()).map(p => ({ id: p.id, name: p.name, alive: !!room.alive[p.id] }));
-}
-
-function tallyVotesAndProceed(roomId) {
-  const room = lobbies[roomId];
-  if (!room) return;
-  room.phase = 'results';
-  clearTurnTimeout(room);
-
-  const tally = {};
-  for (const voted of room.votesByVoter.values()) tally[voted] = (tally[voted] || 0) + 1;
-
-  let ejectId = null;
-  if (Object.keys(tally).length === 0) {
-    const aliveIds = Object.keys(room.alive).filter(id => room.alive[id]);
-    ejectId = aliveIds[Math.floor(Math.random() * aliveIds.length)];
-  } else {
-    let max = -1;
-    let top = [];
-    for (const id in tally) {
-      if (tally[id] > max) { max = tally[id]; top = [id]; }
-      else if (tally[id] === max) top.push(id);
+    function renderPlayers(){
+      playersListEl.innerHTML = '';
+      players.forEach(p => {
+        const row = document.createElement('div'); row.className = 'player';
+        const name = document.createElement('div'); name.className = 'name'; name.textContent = p.name || p.id.slice(-6);
+        const meta = document.createElement('div'); meta.className = 'meta';
+        if (p.id === hostId){ const host = document.createElement('div'); host.className = 'badge'; host.textContent = 'HOST'; meta.appendChild(host); }
+        const rb = document.createElement('div'); rb.className = 'badge ' + (p.ready ? 'ready' : 'notready'); rb.textContent = p.ready ? 'READY' : 'NOT READY';
+        const sc = document.createElement('div'); sc.className = 'score'; sc.textContent = p.score || 0;
+        meta.appendChild(rb); meta.appendChild(sc);
+        row.appendChild(name); row.appendChild(meta);
+        playersListEl.appendChild(row);
+      });
+      playerCountEl.textContent = players.length + ' / 8';
+      updateStartButton();
     }
-    ejectId = top[Math.floor(Math.random() * top.length)];
-  }
 
-  const wasImpostor = ejectId === room.impostorId;
-  room.alive[ejectId] = false;
-
-  const votersWhoPickedImpostor = [];
-  for (const [voter, voted] of room.votesByVoter.entries()) {
-    if (voted === room.impostorId) votersWhoPickedImpostor.push(voter);
-  }
-  if (votersWhoPickedImpostor.length > 0) {
-    votersWhoPickedImpostor.forEach(voterId => { room.scores[voterId] = (room.scores[voterId] || 0) + 1; });
-  } else {
-    room.scores[room.impostorId] = (room.scores[room.impostorId] || 0) + 1;
-  }
-
-  const results = [];
-  for (const [id, p] of room.players) {
-    results.push({
-      id,
-      name: p.name,
-      votes: tally[id] || 0,
-      wasImpostor: id === room.impostorId,
-      score: room.scores[id] || 0
-    });
-    p.score = room.scores[id] || p.score;
-  }
-
-  broadcastToRoom(roomId, { type: 'roundResults', results });
-  broadcastToRoom(roomId, { type: 'playerEjected', id: ejectId, wasImpostor, alive: { ...room.alive } });
-
-  const aliveCount = countAlive(room);
-  if (wasImpostor || aliveCount <= 2) {
-    const standings = Array.from(room.players.values())
-      .sort((a, b) => (room.scores[b.id] || 0) - (room.scores[a.id] || 0))
-      .map(p => ({ id: p.id, name: p.name, score: room.scores[p.id] || 0 }));
-    setTimeout(() => {
-      broadcastToRoom(roomId, { type: 'gameOver', standings });
-      // reset lobby state
-      room.started = false;
-      room.word = null;
-      room.impostorId = null;
-      room.clues = new Map();
-      room.votesByVoter = new Map();
-      room.phase = 'lobby';
-      room.alive = {};
-      for (const [, p] of room.players) p.ready = false;
-      broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
-    }, 1200);
-  } else {
-    // prepare next round: keep same turn order but reset submitted set and start from next index
-    room.submittedSet = new Set();
-    // ensure currentTurnIndex points to next player after the ejected one
-    // find index of ejected in turnOrder and advance to next
-    const idx = room.turnOrder.indexOf(ejectId);
-    if (idx !== -1) {
-      room.currentTurnIndex = idx % room.turnOrder.length;
-      // advance one so startTurn will pick the next alive
-      room.currentTurnIndex = (room.currentTurnIndex + 1) % room.turnOrder.length;
+    function startRoundUI(){
+      submittedClues = {};
+      renderPlayersGrid();
+      setPhase('clue-turns');
+      votingArea.classList.add('hidden');
+      resultsArea.classList.add('hidden');
+      clueStatus.textContent = 'Waiting for turn';
     }
-    setTimeout(() => {
-      room.phase = 'clue-turns';
-      startTurn(roomId);
-    }, 1500);
-  }
-}
 
-server.listen(PORT, () => {
-  console.log(`Impostor Word server listening on port ${PORT}`);
-});
+    function renderPlayersGrid(){
+      playersGrid.innerHTML = '';
+      players.forEach(p => {
+        const card = document.createElement('div');
+        card.className = 'player-card' + (p.alive ? '' : ' spectator') + (p.id === currentTurnId ? ' turn' : '');
+        const pfp = document.createElement('div'); pfp.className = 'pfp'; pfp.textContent = p.alive ? '🧑‍🚀' : '👻';
+        const name = document.createElement('div'); name.className = 'player-name'; name.textContent = p.name || p.id.slice(-6);
+
+        const clueBox = document.createElement('div'); clueBox.className = 'clue-box';
+        if (p.id === myId) {
+          if (!p.alive || isSpectator) {
+            const txt = document.createElement('div'); txt.className = 'clue-text'; txt.textContent = 'Spectating';
+            clueBox.appendChild(txt);
+          } else if (currentTurnId === myId) {
+            if (submittedClues[myId] !== undefined) {
+              const txt = document.createElement('div'); txt.className = 'clue-text'; txt.textContent = submittedClues[myId] || '(skipped)';
+              clueBox.appendChild(txt);
+            } else {
+              const input = document.createElement('input'); input.className = 'clue-input'; input.placeholder = 'Type your clue...'; input.maxLength = 80;
+              const btn = document.createElement('button'); btn.className = 'clue-submit'; btn.textContent = 'Submit';
+              btn.addEventListener('click', () => {
+                const text = (input.value||'').trim();
+                if (!text) return;
+                send({ type: 'submitClue', room: currentRoom, text });
+                submittedClues[myId] = text; // optimistic
+                renderPlayersGrid();
+              });
+              clueBox.appendChild(input); clueBox.appendChild(btn);
+            }
+          } else {
+            // not my turn
+            const txt = document.createElement('div'); txt.className = 'clue-text';
+            txt.textContent = (submittedClues[myId] !== undefined) ? (submittedClues[myId] || '(skipped)') : 'Waiting for your turn';
+            clueBox.appendChild(txt);
+          }
+        } else {
+          const txt = document.createElement('div'); txt.className = 'clue-text';
+          if (!p.alive) txt.textContent = 'Ejected';
+          else if (submittedClues[p.id] !== undefined) txt.textContent = submittedClues[p.id] || '(skipped)';
+          else txt.textContent = (p.id === currentTurnId) ? 'Entering clue now' : 'Waiting...';
+          clueBox.appendChild(txt);
+        }
+
+        card.appendChild(pfp);
+        card.appendChild(name);
+        card.appendChild(clueBox);
+        playersGrid.appendChild(card);
+      });
+    }
+
+    function renderVotingPlayers(list){
+      votingPlayersList.innerHTML = '';
+      const source = list || players.map(p => ({ id: p.id, name: p.name, alive: p.alive }));
+      source.forEach(item => {
+        const id = item.id;
+        const name = item.name || id.slice(-6);
+        const alive = (typeof item.alive === 'boolean') ? item.alive : ((players.find(p => p.id === id) || {}).alive ?? true);
+        const btn = document.createElement('button'); btn.className = 'vote-btn';
+        if (id === myId || !alive || isSpectator) {
+          btn.classList.add('disabled'); btn.disabled = true;
+          btn.textContent = `${name} ${id === myId ? '— you' : alive ? '' : '(ejected)'}`;
+        } else {
+          btn.textContent = name;
+          btn.addEventListener('click', () => { votingStatus.textContent = 'Voting...'; send({ type: 'voteImpostor', room: currentRoom, votedId: id }); });
+        }
+        votingPlayersList.appendChild(btn);
+      });
+    }
+
+    function renderFinalStandings(standings){
+      finalStandings.innerHTML = '';
+      standings.forEach((s, idx) => {
+        const d = document.createElement('div'); d.className = 'choice';
+        d.style.padding = '10px'; d.style.background = 'rgba(255,255,255,0.04)'; d.style.borderRadius = '8px';
+        d.innerHTML = `<div style="font-weight:900">${idx+1}. ${escapeHtml(s.name)} <span style="color:#E91E63;margin-left:8px">${s.score}</span></div>`;
+        finalStandings.appendChild(d);
+      });
+    }
+
+    // Buttons
+    readyBtn.addEventListener('click', () => { if (!hasJoined || !currentRoom) return; send({ type: 'ready', room: currentRoom }); });
+    unreadyBtn.addEventListener('click', () => { if (!hasJoined || !currentRoom) return; send({ type: 'unready', room: currentRoom }); });
+    startBtn.addEventListener('click', () => { if (!hasJoined || !currentRoom) return; startBtn.disabled = true; send({ type: 'startGame', room: currentRoom }); });
+    leaveBtn.addEventListener('click', leaveLobby);
+    backToLobbyBtn.addEventListener('click', showLobby);
+
+    // Lobby buttons
+    function renderLobbyButtonsInit(){
+      lobbyButtonsEl.innerHTML = '';
+      ['lobby1','lobby2','lobby3','lobby4'].forEach((id, idx) => {
+        const b = document.createElement('button');
+        b.className = 'big-btn'; b.type = 'button';
+        b.textContent = `Lobby ${idx+1}`;
+        b.addEventListener('click', () => joinLobby(id));
+        lobbyButtonsEl.appendChild(b);
+        lobbyButtonsMap.set(id, b);
+      });
+    }
+
+    // init
+    renderLobbyButtonsInit();
+    connect();
+    showLobby();
+  })();
+  </script>
+</body>
+</html>
