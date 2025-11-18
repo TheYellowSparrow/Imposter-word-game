@@ -1,8 +1,5 @@
 // server.js
-// Turn-based Impostor Word server: one player submits per turn, no duplicates.
-// Random player starts; order follows lobby insertion order. Robust advancing on submit/timeout/leave.
-// Fixes: after a round ends, clues and votes are reset and clients are notified so UI returns to clue phase.
-// Kicked players remain spectating (alive=false) and are excluded from future turns.
+// Turn-based Impostor Word server with explicit gameOver winner/reason/roles payload.
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -101,11 +98,9 @@ wss.on('connection', (ws) => {
       const idx = room.turnOrder.indexOf(ws._id);
       if (idx !== -1) {
         room.turnOrder = room.turnOrder.filter(x => x !== ws._id);
-        // if removed index is before currentTurnIndex, shift index back by one to keep pointing to same logical next
         if (idx < room.currentTurnIndex) {
           room.currentTurnIndex = Math.max(0, room.currentTurnIndex - 1);
         }
-        // if currentTurnId was the leaving player, mark as consumed and advance
         if (room.currentTurnId === ws._id) {
           clearTurnTimeout(room);
           room.submittedSet.add(ws._id);
@@ -205,7 +200,6 @@ function handleMessage(ws, data) {
     if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
     if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
 
-    // remove from turnOrder and adjust index
     if (Array.isArray(room.turnOrder) && room.turnOrder.length) {
       const idx = room.turnOrder.indexOf(ws._id);
       if (idx !== -1) {
@@ -536,24 +530,46 @@ function tallyVotesAndProceed(roomId) {
   broadcastToRoom(roomId, { type: 'playerEjected', id: ejectId, wasImpostor, alive: { ...room.alive } });
 
   // --- Reset clues and voting state so clients can start fresh next round ---
-  // Clear server-side stored clues and votes for the next round
   room.clues = new Map();
   room.votesByVoter = new Map();
-  // submittedSet will be reset when preparing next round below, but clear now to be safe
   room.submittedSet = new Set();
 
-  // Notify clients to clear their clue inputs and hide voting UI
-  // Clients should listen for 'roundReset' (or similar) and clear submittedClues, hide voting area, etc.
   broadcastToRoom(roomId, { type: 'roundReset' });
 
   // end or next round
   const aliveCount = countAlive(room);
+
+  // Build roles snapshot for reveal before we reset anything
+  const rolesSnapshot = Array.from(room.players.keys()).map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
+
   if (wasImpostor || aliveCount <= 2) {
+    // Determine winner and reason
+    let winner = 'none';
+    let reason = '';
+    if (wasImpostor) {
+      winner = 'crewmates';
+      reason = 'Impostor was ejected';
+    } else if (aliveCount <= 2) {
+      winner = 'impostor';
+      reason = 'Only two players remain';
+    }
+
     const standings = Array.from(room.players.values())
       .sort((a, b) => (room.scores[b.id] || 0) - (room.scores[a.id] || 0))
       .map(p => ({ id: p.id, name: p.name, score: room.scores[p.id] || 0 }));
+
+    // Broadcast gameOver with winner, reason, and roles snapshot
     setTimeout(() => {
-      broadcastToRoom(roomId, { type: 'gameOver', standings });
+      broadcastToRoom(roomId, {
+        type: 'gameOver',
+        standings,
+        winner,
+        reason,
+        roles: rolesSnapshot,
+        impostorId: room.impostorId,
+        word: room.word
+      });
+
       // reset lobby state
       room.started = false;
       room.word = null;
@@ -569,15 +585,12 @@ function tallyVotesAndProceed(roomId) {
     // next round: rebuild turnOrder to reflect current alive players and preserve insertion order
     room.submittedSet = new Set();
     room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))).filter(id => room.alive[id]);
-
-    // Ensure currentTurnIndex is valid and start from the next logical player
     if (room.turnOrder.length > 0) {
       room.currentTurnIndex = room.currentTurnIndex % room.turnOrder.length;
     } else {
       room.currentTurnIndex = 0;
     }
 
-    // small delay so clients can show results/ejection then reset UI and start next clue-turns
     setTimeout(() => {
       room.phase = 'clue-turns';
       room.currentTurnId = null;
