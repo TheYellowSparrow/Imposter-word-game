@@ -1,8 +1,8 @@
 // server.js
 // Turn-based Impostor Word server: one player submits per turn, no duplicates.
 // Random player starts; order follows lobby insertion order. Robust advancing on submit/timeout/leave.
-// Voting timer removed: voting no longer auto-ends on timeout; it proceeds when all alive players have voted.
-// Voting duration hint set to 120 seconds for UI only.
+// Fixes: after a round ends, clues and votes are reset and clients are notified so UI returns to clue phase.
+// Kicked players remain spectating (alive=false) and are excluded from future turns.
 
 const http = require('http');
 const WebSocket = require('ws');
@@ -57,7 +57,6 @@ function broadcastToRoomExcept(roomId, obj, excludeId) {
 }
 function broadcastLobbyCounts() {
   const arr = Object.keys(lobbies).map(id => ({ id, count: lobbies[id].players.size }));
-  // wss is defined below; safe to reference here because this function is called after server/wss created
   wss.clients.forEach(c => {
     if (c.readyState === WebSocket.OPEN) send(c, { type: 'lobbyList', lobbies: arr });
   });
@@ -102,9 +101,11 @@ wss.on('connection', (ws) => {
       const idx = room.turnOrder.indexOf(ws._id);
       if (idx !== -1) {
         room.turnOrder = room.turnOrder.filter(x => x !== ws._id);
+        // if removed index is before currentTurnIndex, shift index back by one to keep pointing to same logical next
         if (idx < room.currentTurnIndex) {
           room.currentTurnIndex = Math.max(0, room.currentTurnIndex - 1);
         }
+        // if currentTurnId was the leaving player, mark as consumed and advance
         if (room.currentTurnId === ws._id) {
           clearTurnTimeout(room);
           room.submittedSet.add(ws._id);
@@ -113,9 +114,11 @@ wss.on('connection', (ws) => {
       }
     }
 
+    // notify remaining players
     broadcastToRoomExcept(roomId, { type: 'playerLeft', room: roomId, id: ws._id }, ws._id);
     broadcastLobbyCounts();
 
+    // reassign host if needed
     if (room.hostId === ws._id) {
       const next = room.players.keys().next();
       room.hostId = next.done ? null : next.value;
@@ -123,6 +126,7 @@ wss.on('connection', (ws) => {
       broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
     }
 
+    // cleanup empty room
     if (room.players.size === 0) {
       delete lobbies[roomId];
       broadcastLobbyCounts();
@@ -174,6 +178,7 @@ function handleMessage(ws, data) {
 
     room.players.set(ws._id, { ws, id: ws._id, name, ready: false, score: 0 });
 
+    // ensure alive and scores entries exist for this player
     room.alive[ws._id] = true;
     room.scores[ws._id] = room.scores[ws._id] || 0;
 
@@ -200,6 +205,7 @@ function handleMessage(ws, data) {
     if (room.alive && room.alive[ws._id] !== undefined) delete room.alive[ws._id];
     if (room.scores && room.scores[ws._id] !== undefined) delete room.scores[ws._id];
 
+    // remove from turnOrder and adjust index
     if (Array.isArray(room.turnOrder) && room.turnOrder.length) {
       const idx = room.turnOrder.indexOf(ws._id);
       if (idx !== -1) {
@@ -250,6 +256,7 @@ function handleMessage(ws, data) {
     if (room.hostId !== ws._id) { send(ws, { type: 'error', message: 'Only host can start' }); return; }
     if (room.players.size < 3) { send(ws, { type: 'error', message: 'Need at least 3 players' }); return; }
 
+    // initialize game
     room.started = true;
     room.word = WORDS[Math.floor(Math.random() * WORDS.length)];
     const ids = Array.from(new Set(Array.from(room.players.keys()))); // de-dup safety
@@ -258,13 +265,16 @@ function handleMessage(ws, data) {
     room.votesByVoter = new Map();
     room.phase = 'reveal';
 
+    // ensure alive and scores are set for all players
     ids.forEach(id => {
       room.alive[id] = true;
       room.scores[id] = room.scores[id] || room.players.get(id).score || 0;
     });
 
+    // build roles array
     const roles = ids.map(id => ({ id, role: id === room.impostorId ? 'IMPOSTOR' : room.word }));
 
+    // broadcast gameStarted
     broadcastToRoom(roomId, {
       type: 'gameStarted',
       roles,
@@ -272,11 +282,10 @@ function handleMessage(ws, data) {
       seconds: CLUE_SECONDS
     });
 
+    // prepare turn order and start first turn after reveal
     setTimeout(() => {
-      // fixed order for the round: insertion order of players, filtered to alive
       room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))).filter(id => room.alive[id]);
       if (room.turnOrder.length === 0) {
-        // move directly to voting (no auto-timeout)
         room.phase = 'vote';
         broadcastToRoom(roomId, { type: 'votingStarted', players: playersWithAlive(room), seconds: VOTE_SECONDS });
         return;
@@ -457,11 +466,13 @@ function tallyVotesAndProceed(roomId) {
   room.phase = 'results';
   clearTurnTimeout(room);
 
+  // tally votes
   const tally = {};
   for (const voted of room.votesByVoter.values()) {
     tally[voted] = (tally[voted] || 0) + 1;
   }
 
+  // choose eject target
   let ejectId = null;
   if (Object.keys(tally).length === 0) {
     const aliveIds = Object.keys(room.alive).filter(id => room.alive[id]);
@@ -496,6 +507,7 @@ function tallyVotesAndProceed(roomId) {
     }
   }
 
+  // scoring
   const votersWhoPickedImpostor = [];
   for (const [voter, voted] of room.votesByVoter.entries()) {
     if (voted === room.impostorId) votersWhoPickedImpostor.push(voter);
@@ -506,6 +518,7 @@ function tallyVotesAndProceed(roomId) {
     room.scores[room.impostorId] = (room.scores[room.impostorId] || 0) + 1;
   }
 
+  // prepare results
   const results = [];
   for (const [id, p] of room.players) {
     results.push({
@@ -518,9 +531,22 @@ function tallyVotesAndProceed(roomId) {
     p.score = room.scores[id] || p.score;
   }
 
+  // broadcast results and ejection
   broadcastToRoom(roomId, { type: 'roundResults', results });
   broadcastToRoom(roomId, { type: 'playerEjected', id: ejectId, wasImpostor, alive: { ...room.alive } });
 
+  // --- Reset clues and voting state so clients can start fresh next round ---
+  // Clear server-side stored clues and votes for the next round
+  room.clues = new Map();
+  room.votesByVoter = new Map();
+  // submittedSet will be reset when preparing next round below, but clear now to be safe
+  room.submittedSet = new Set();
+
+  // Notify clients to clear their clue inputs and hide voting UI
+  // Clients should listen for 'roundReset' (or similar) and clear submittedClues, hide voting area, etc.
+  broadcastToRoom(roomId, { type: 'roundReset' });
+
+  // end or next round
   const aliveCount = countAlive(room);
   if (wasImpostor || aliveCount <= 2) {
     const standings = Array.from(room.players.values())
@@ -528,6 +554,7 @@ function tallyVotesAndProceed(roomId) {
       .map(p => ({ id: p.id, name: p.name, score: room.scores[p.id] || 0 }));
     setTimeout(() => {
       broadcastToRoom(roomId, { type: 'gameOver', standings });
+      // reset lobby state
       room.started = false;
       room.word = null;
       room.impostorId = null;
@@ -539,17 +566,21 @@ function tallyVotesAndProceed(roomId) {
       broadcastToRoom(roomId, { type: 'lobbyInfo', room: roomId, count: room.players.size });
     }, 1200);
   } else {
+    // next round: rebuild turnOrder to reflect current alive players and preserve insertion order
     room.submittedSet = new Set();
-    // rebuild turnOrder to reflect current alive players and preserve insertion order
     room.turnOrder = Array.from(new Set(Array.from(room.players.keys()))).filter(id => room.alive[id]);
+
+    // Ensure currentTurnIndex is valid and start from the next logical player
     if (room.turnOrder.length > 0) {
       room.currentTurnIndex = room.currentTurnIndex % room.turnOrder.length;
     } else {
       room.currentTurnIndex = 0;
     }
 
+    // small delay so clients can show results/ejection then reset UI and start next clue-turns
     setTimeout(() => {
       room.phase = 'clue-turns';
+      room.currentTurnId = null;
       startTurn(roomId);
     }, 1500);
   }
